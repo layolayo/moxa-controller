@@ -8,7 +8,9 @@ This repository contains the architectural documentation, reverse-engineering me
 
 * [`docs/01-moxa-linux-architecture.md`](docs/01-moxa-linux-architecture.md) — Comprehensive guide to interfacing a Linux application with an Ethernet-connected Moxa serial device (Direct TCP/UDP Socket Mode, RFC 2217, Moxa `npreal2` Real TTY driver, and `socat` user-space PTY bridges).
 * [`docs/02-rs232-sniffing-and-protocol-analysis.md`](docs/02-rs232-sniffing-and-protocol-analysis.md) — Engineering handbook for non-intrusively tapping, capturing, and reverse-engineering bidirectional RS-232 serial traffic between two legacy devices.
+* [`docs/03-nport-configuration-and-wiring.md`](docs/03-nport-configuration-and-wiring.md) — Dedicated Moxa NPort playbook: DB9 Male vs 8-pin RJ45 pinouts, NPort passive tap & active MITM topologies, critical web UI tuning (`Force Transmit`, `FIFO`, `Max Connection = 2`), and out-of-band UART control via the ASPP Command Port (`966`).
 * [`tools/serial_tap_logger.py`](tools/serial_tap_logger.py) — Dual-channel RS-232 tap logger supporting both Moxa TCP Server sockets and local `/dev/tty*` interfaces, with microsecond timestamping, automatic inter-frame gap detection, hex/ASCII side-by-side inspection, and JSONL structured logging.
+* [`tools/nport_probe.py`](tools/nport_probe.py) — Moxa NPort network port scanner and automatic baud-rate detector using the NPort's ASPP Command Port (`966+`) and TCP Data Port (`4001+`).
 
 ---
 
