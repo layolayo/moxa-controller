@@ -11,8 +11,9 @@ This repository contains the **Rust (`tokio` + `ratatui`)** production backend, 
   * **Automatic Moxa Hardware Model & Port-Count Detection (`auto_detect_nport_model`):** Queries the target Moxa IP via **UDP Port 4800 (Moxa DSU `0x01` Identify)**, **HTTP Port 80 Web Banner**, and **Active TCP/ASPP Port-Range Scanning (`4001..4016` & `966..981`)** to automatically identify the model (`NPort 5610-8-DT`, `5650-8-DT`, `5450`, `5410`, `5250A`, `5210A`, `5110`, etc.), port count (`1`, `2`, `4`, `8`, or `16`), electrical interface (`RS-232` vs `RS-232/422/485`), and connector pinout (`DB9 Male` vs `8-Pin RJ45`).
   * **Moxa ASPP Hardware Command Plane (`TCP 966..981`):** Live UART configuration (`1200`–`230400` baud, `8N1`/`8E1`/`8O1`/`7E1`/`8N2`/`8M1`/`8S1`), physical `DTR`/`RTS` output pin toggling (`0x12`), live `CTS`/`DSR`/`DCD`/`RI` input polling (`0x13`), hardware FIFO flushing (`0x14`), and `BREAK` pulse generation (`0x15`/`0x21`).
   * **Low-Latency Serial Data & Sniffing Engine (`TCP 4001..4016`):** Microsecond inter-frame gap packetisation, **Passive Dual-RX Tapping**, **Active Man-in-the-Middle (MITM) Bridging**, **Byte-Diff Tracking** (automatically flags which byte offsets changed between consecutive frames), and real-time `XOR8`, `LRC`, and `CRC-16/MODBUS` calculation.
-* **[`crates/smt-tui/`](crates/smt-tui/)** — Compiled `ratatui` operator and protocol-sniffing console (`smt-tui`). Designed to run in a terminal window alongside the main Wayland SMT control application (or over SSH), dynamically adapting its UI layout to the detected Moxa NPort model.
-* **[`crates/smt-daemon/`](crates/smt-daemon/)** — 24/7 headless background service (`smt-daemon`) and local JSON IPC server (`127.0.0.1:7450`) for the Wayland desktop SMT control GUI, packaged with [`deploy/smt-daemon.service`](deploy/smt-daemon.service).
+* **[`crates/smt-gui/`](crates/smt-gui/)** — Native Wayland/X11 desktop GUI (`smt-gui` built with `eframe`/`egui`). Features live IP switching, UDP 4800 LAN discovery badges, adaptive multi-port LED status matrix, one-click Passive Tap & Active MITM controls, on-demand stream/buffer logging, and a click-to-inspect **Byte & Bit Dissector Drawer**.
+* **[`crates/smt-tui/`](crates/smt-tui/)** — Compiled `ratatui` operator and protocol-sniffing terminal console (`smt-tui`). Ideal for terminal windows or SSH sessions, dynamically adapting its layout to the detected Moxa NPort model.
+* **[`crates/smt-daemon/`](crates/smt-daemon/)** — 24/7 headless background service (`smt-daemon`) and local JSON IPC server (`127.0.0.1:7450`), packaged with [`deploy/smt-daemon.service`](deploy/smt-daemon.service).
 
 ### 2. Documentation & Rapid Prototyping Tools
 * **[`docs/01-moxa-linux-architecture.md`](docs/01-moxa-linux-architecture.md)** — Guide to Moxa Ethernet-to-Serial architectures on Linux (Direct TCP Socket Mode, RFC 2217, Moxa `npreal2` Real TTY driver, and `socat` PTY bridges).
@@ -31,11 +32,20 @@ cd ~/Projects/smt-control-system
 # Run unit tests (ASPP codecs, model auto-detection, CRC-16/MODBUS, payload parsers)
 cargo test --workspace
 
-# Build optimised release binaries (target/release/smt-tui & target/release/smt-daemon)
+# Build optimised release binaries (smt-gui, smt-tui, and smt-daemon)
 cargo build --release
 ```
 
-### 2. Launch the Compiled Rust TUI (`smt-tui`)
+### 2. Launch the Native Wayland/X11 Desktop GUI (`smt-gui`)
+```bash
+# 1. Launch the full desktop GUI in Demo Mode (simulated NPort 5610-8-DT traffic):
+./target/release/smt-gui --demo
+
+# 2. Or connect directly to your physical Moxa NPort IP address:
+./target/release/smt-gui 192.168.127.254
+```
+
+### 3. Launch the Compiled Terminal UI (`smt-tui`)
 ```bash
 # 1. Launch in interactive Demo / Simulation mode (with synthetic SMT traffic & byte-diff highlighting):
 ./target/release/smt-tui --demo
