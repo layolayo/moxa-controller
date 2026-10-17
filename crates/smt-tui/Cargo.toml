@@ -1,0 +1,15 @@
+[package]
+name = "smt-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Interactive ratatui terminal console for Moxa NPort 5610-8-DT connection, configuration, and RS-232 protocol sniffing"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+crossterm.workspace = true
+nport5610-core.workspace = true
+ratatui.workspace = true
+tokio.workspace = true

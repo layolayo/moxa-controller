@@ -1,0 +1,14 @@
+[package]
+name = "nport5610-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Core driverless protocol engine for the 8-port Moxa NPort 5610-8-DT (UDP 4800, ASPP 966-973, TCP Data 4001-4008)"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

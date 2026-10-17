@@ -1,0 +1,10 @@
+# Rust build artefacts
+/target/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Recorded serial captures & logs
+*.jsonl
+*.log
