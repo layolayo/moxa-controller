@@ -772,12 +772,164 @@ impl SerialFrame {
     }
 }
 
+/// Direction filter options for narrowing down captured RS-232 traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirectionFilter {
+    All,
+    CtrlToDev,
+    DevToCtrl,
+    TxInjected,
+}
+
+impl DirectionFilter {
+    pub const ALL: [DirectionFilter; 4] = [
+        DirectionFilter::All,
+        DirectionFilter::CtrlToDev,
+        DirectionFilter::DevToCtrl,
+        DirectionFilter::TxInjected,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DirectionFilter::All => "All Directions",
+            DirectionFilter::CtrlToDev => "CTRL→DEV Only",
+            DirectionFilter::DevToCtrl => "DEV→CTRL Only",
+            DirectionFilter::TxInjected => "TX Injected Only",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&d| d == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    pub fn matches(self, direction_label: &str) -> bool {
+        match self {
+            DirectionFilter::All => true,
+            DirectionFilter::CtrlToDev => {
+                direction_label.contains("CTRL→DEV") || direction_label.contains("MITM→P2")
+            }
+            DirectionFilter::DevToCtrl => {
+                direction_label.contains("DEV→CTRL")
+                    || direction_label.contains("RX←DEV")
+                    || direction_label.contains("MITM→P1")
+            }
+            DirectionFilter::TxInjected => direction_label.contains("TX→LINE"),
+        }
+    }
+}
+
+/// Configurable multi-criteria stream filter for reverse-engineering serial protocols.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameFilter {
+    pub port_filter: Option<u8>,
+    pub direction: DirectionFilter,
+    pub only_changed: bool,
+    pub search_query: String,
+    pub min_len: Option<usize>,
+    pub max_len: Option<usize>,
+}
+
+impl Default for FrameFilter {
+    fn default() -> Self {
+        Self {
+            port_filter: None,
+            direction: DirectionFilter::All,
+            only_changed: false,
+            search_query: String::new(),
+            min_len: None,
+            max_len: None,
+        }
+    }
+}
+
+impl FrameFilter {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.port_filter.is_some()
+            || self.direction != DirectionFilter::All
+            || self.only_changed
+            || !self.search_query.trim().is_empty()
+            || self.min_len.is_some()
+            || self.max_len.is_some()
+    }
+
+    pub fn matches(&self, frame: &SerialFrame) -> bool {
+        if let Some(p) = self.port_filter {
+            if frame.port_num != p {
+                return false;
+            }
+        }
+        if !self.direction.matches(&frame.direction) {
+            return false;
+        }
+        if self.only_changed && frame.changed_indices.is_empty() {
+            return false;
+        }
+        if let Some(min_l) = self.min_len {
+            if frame.payload.len() < min_l {
+                return false;
+            }
+        }
+        if let Some(max_l) = self.max_len {
+            if frame.payload.len() > max_l {
+                return false;
+            }
+        }
+        let q = self.search_query.trim();
+        if !q.is_empty() {
+            let q_up = q.to_uppercase();
+            let hex_match = frame.hex_string().contains(&q_up);
+            let ascii_match = frame.ascii_string().to_uppercase().contains(&q_up);
+            let dir_match = frame.direction.to_uppercase().contains(&q_up);
+            if !(hex_match || ascii_match || dir_match) {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(p) = self.port_filter {
+            parts.push(format!("Port=P{p}"));
+        }
+        if self.direction != DirectionFilter::All {
+            parts.push(format!("Dir={}", self.direction.as_str()));
+        }
+        if self.only_changed {
+            parts.push(String::from("ChangedOnly=ON"));
+        }
+        if let Some(min_l) = self.min_len {
+            parts.push(format!("MinLen={min_l}B"));
+        }
+        if let Some(max_l) = self.max_len {
+            parts.push(format!("MaxLen={max_l}B"));
+        }
+        let q = self.search_query.trim();
+        if !q.is_empty() {
+            parts.push(format!("Match=\"{q}\""));
+        }
+        if parts.is_empty() {
+            String::from("None (Showing All Frames)")
+        } else {
+            parts.join(" | ")
+        }
+    }
+}
+
 pub struct SharedEngineState {
     pub host: String,
     pub profile: NPortModelProfile,
     pub discovery_method: String,
     pub gap_ms: f64,
     pub simulate: bool,
+    pub stream_paused: bool,
+    pub paused_skipped_frames: u64,
+    pub filter: FrameFilter,
     pub mode_banner: String,
     pub ports: Vec<PortState>,
     pub frames: VecDeque<SerialFrame>,
@@ -830,6 +982,9 @@ impl SharedEngineState {
             },
             gap_ms,
             simulate,
+            stream_paused: false,
+            paused_skipped_frames: 0,
+            filter: FrameFilter::default(),
             mode_banner: if simulate {
                 String::from("PASSIVE TAP (P1 + P2) [DEMO]")
             } else {
@@ -858,6 +1013,30 @@ impl SharedEngineState {
             host
         ));
         st
+    }
+
+    pub fn toggle_pause(&mut self) -> bool {
+        self.stream_paused = !self.stream_paused;
+        if self.stream_paused {
+            self.paused_skipped_frames = 0;
+            self.log_event("Stream PAUSED — live display frozen for inspection");
+        } else {
+            let skipped = self.paused_skipped_frames;
+            self.paused_skipped_frames = 0;
+            self.log_event(format!(
+                "Stream RESUMED ({skipped} background frames elapsed while paused)"
+            ));
+        }
+        self.stream_paused
+    }
+
+    /// Return all buffered frames that match the current `FrameFilter`.
+    pub fn filtered_frames(&self) -> Vec<SerialFrame> {
+        self.frames
+            .iter()
+            .filter(|f| self.filter.matches(f))
+            .cloned()
+            .collect()
     }
 
     /// Adapt the engine's port table and metadata dynamically to a newly detected Moxa NPort profile.
@@ -907,6 +1086,10 @@ impl SharedEngineState {
     }
 
     pub fn record_frame(&mut self, port_num: u8, direction: impl Into<String>, payload: Vec<u8>) {
+        if self.stream_paused {
+            self.paused_skipped_frames += 1;
+            return;
+        }
         let direction = direction.into();
         let now = Local::now();
         let now_inst = Instant::now();
@@ -1051,15 +1234,25 @@ impl SharedEngineState {
             .open(&jsonl_path)
             .ok();
 
+        let matching = self.filtered_frames();
+        let total = self.frames.len();
+        let filter_desc = self.filter.summary();
+
         let _ = writeln!(
             tf,
             "# SMT Control System On-Demand Buffer Dump — {} ({}-Port {}) @ {}",
             self.profile.model_name, self.profile.port_count, self.profile.interfaces, self.host
         );
-        let _ = writeln!(tf, "# Captured Frames: {}", self.frames.len());
+        let _ = writeln!(
+            tf,
+            "# Filter: {} | Matching Frames: {} / {}",
+            filter_desc,
+            matching.len(),
+            total
+        );
         let _ = writeln!(tf, "{}", "-".repeat(120));
 
-        for fr in &self.frames {
+        for fr in &matching {
             let _ = writeln!(tf, "{}", fr.format_log_line());
             if let Some(ref mut jfile) = jf {
                 if let Ok(js) = serde_json::to_string(fr) {
@@ -1068,9 +1261,9 @@ impl SharedEngineState {
             }
         }
         let _ = tf.flush();
-        let count = self.frames.len();
+        let count = matching.len();
         self.log_event(format!(
-            "Dumped {count} buffered frames on demand -> {} (+ .jsonl)",
+            "Dumped {count}/{total} frames (Filter: {filter_desc}) -> {} (+ .jsonl)",
             log_path.display()
         ));
         Some(log_path)
@@ -1517,6 +1710,27 @@ impl NPortController {
         st.log_event(format!("Disconnected Port {port_num}"));
     }
 
+    /// Stop and disconnect all active serial streams across all ports on the NPort unit.
+    pub fn stop_all_streams(&self) {
+        let max_p = { self.state.lock().unwrap().ports.len() as u8 };
+        for p in 1..=max_p {
+            let mut st = self.state.lock().unwrap();
+            st.tx_senders.remove(&p);
+            st.mitm_peer.remove(&p);
+            if let Some(ps) = st.ports.get_mut((p - 1) as usize) {
+                ps.connected = false;
+                ps.role = String::from("IDLE");
+            }
+        }
+        let mut st = self.state.lock().unwrap();
+        st.stream_paused = false;
+        st.paused_skipped_frames = 0;
+        st.mode_banner = String::from("STOPPED (ALL STREAMS IDLE)");
+        st.log_event(format!(
+            "Stopped all active streams across ports 1..{max_p}"
+        ));
+    }
+
     pub async fn start_passive_tap(&self, port_a: u8, port_b: u8) {
         let max_p = { self.state.lock().unwrap().ports.len() as u8 };
         for p in 1..=max_p {
@@ -1682,5 +1896,39 @@ mod tests {
         let cs = ChecksumSummary::compute(&frame);
         assert_eq!(cs.crc16_modbus, 0xCDC5);
         assert_eq!(cs.xor8, 0x01 ^ 0x03 ^ 0x0A);
+    }
+
+    #[test]
+    fn test_frame_filter_options_and_pause() {
+        let mut st = SharedEngineState::new("192.168.127.254".into(), 8.0, false);
+        st.record_frame(1, "P1 CTRL→DEV", b"\x0201POLL:01\x03".to_vec());
+        st.record_frame(1, "P1 CTRL→DEV", b"\x0201POLL:01\x03".to_vec()); // identical static heartbeat
+        st.record_frame(1, "P1 CTRL→DEV", b"\x0201POLL:02\x03".to_vec()); // changed byte at index 9
+        st.record_frame(2, "P2 DEV→CTRL", b"\x0201OK:T=248C\x03".to_vec());
+        assert_eq!(st.frames.len(), 4);
+
+        // Pause stream and verify incoming frames are skipped while paused
+        st.toggle_pause();
+        st.record_frame(1, "P1 CTRL→DEV", b"\x0201POLL:03\x03".to_vec());
+        assert_eq!(st.frames.len(), 4);
+        assert_eq!(st.paused_skipped_frames, 1);
+        st.toggle_pause();
+        assert!(!st.stream_paused);
+
+        // Direction filter: DEV→CTRL only
+        st.filter.direction = DirectionFilter::DevToCtrl;
+        assert_eq!(st.filtered_frames().len(), 1);
+
+        // Changed-bytes-only filter on CTRL→DEV
+        st.filter.direction = DirectionFilter::CtrlToDev;
+        st.filter.only_changed = true;
+        let changed = st.filtered_frames();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].seq, 3);
+
+        // Search query filter (ASCII or Hex)
+        st.filter.reset();
+        st.filter.search_query = String::from("248C");
+        assert_eq!(st.filtered_frames().len(), 1);
     }
 }

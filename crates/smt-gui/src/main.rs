@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use eframe::egui::{self, Color32, FontId, RichText, ScrollArea, Stroke};
 use nport5610_core::{
-    adjacent_port_pair, discover_nports_udp, parse_payload_input, DiscoveredNPort,
-    NPortController, NPortModelProfile, SerialFrame,
+    adjacent_port_pair, discover_nports_udp, parse_payload_input, DirectionFilter,
+    DiscoveredNPort, FrameFilter, NPortController, NPortModelProfile, SerialFrame,
 };
 
 const DEMO_MODEL_IDS: [u16; 4] = [0x5610, 0x5450, 0x5250, 0x5110];
@@ -18,6 +18,8 @@ struct SmtGuiApp {
     selected_port: u8,
     tx_payload_input: String,
     log_note_input: String,
+    min_len_input: String,
+    max_len_input: String,
     selected_frame_seq: Option<u64>,
     discovered_units: Vec<DiscoveredNPort>,
     demo_model_idx: usize,
@@ -48,6 +50,8 @@ impl SmtGuiApp {
             selected_port: 1,
             tx_payload_input: String::from("\\x0201POLL:99\\x03"),
             log_note_input: String::new(),
+            min_len_input: String::new(),
+            max_len_input: String::new(),
             selected_frame_seq: None,
             discovered_units: Vec::new(),
             demo_model_idx: 0,
@@ -81,9 +85,13 @@ impl eframe::App for SmtGuiApp {
             profile,
             discovery_method,
             mode_banner,
+            stream_paused,
+            paused_skipped,
+            filter_snapshot,
             active_log_path,
             ports,
-            frames,
+            total_frames,
+            filtered_frames,
             status_log,
         ) = {
             let st = self.ctrl.state.lock().unwrap();
@@ -92,9 +100,13 @@ impl eframe::App for SmtGuiApp {
                 st.profile.clone(),
                 st.discovery_method.clone(),
                 st.mode_banner.clone(),
+                st.stream_paused,
+                st.paused_skipped_frames,
+                st.filter.clone(),
                 st.text_log_path.clone(),
                 st.ports.clone(),
-                st.frames.iter().cloned().collect::<Vec<_>>(),
+                st.frames.len(),
+                st.filtered_frames(),
                 st.status_log.iter().cloned().collect::<Vec<_>>(),
             )
         };
@@ -180,6 +192,37 @@ impl eframe::App for SmtGuiApp {
                         profile: new_prof,
                         discovery_method: String::from("Simulated Model Switch"),
                     });
+                }
+
+                ui.separator();
+
+                // Stream Pause / Resume & Stop All Streams Controls
+                let pause_btn_text = if stream_paused {
+                    RichText::new(format!("▶ Resume Stream ({paused_skipped} skipped)"))
+                        .color(Color32::BLACK)
+                        .strong()
+                } else {
+                    RichText::new("⏸ Pause Stream").color(Color32::WHITE)
+                };
+                let pause_btn = egui::Button::new(pause_btn_text).fill(if stream_paused {
+                    Color32::from_rgb(245, 175, 40)
+                } else {
+                    Color32::from_rgb(55, 65, 81)
+                });
+                if ui.add(pause_btn).clicked() {
+                    self.ctrl.state.lock().unwrap().toggle_pause();
+                }
+
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("⏹ Stop All Streams").color(Color32::from_rgb(255, 140, 140)),
+                        )
+                        .fill(Color32::from_rgb(65, 35, 40)),
+                    )
+                    .clicked()
+                {
+                    self.ctrl.stop_all_streams();
                 }
 
                 ui.separator();
@@ -315,8 +358,8 @@ impl eframe::App for SmtGuiApp {
                     );
                     let inspected: Option<&SerialFrame> = self
                         .selected_frame_seq
-                        .and_then(|seq| frames.iter().find(|f| f.seq == seq))
-                        .or_else(|| frames.last());
+                        .and_then(|seq| filtered_frames.iter().find(|f| f.seq == seq))
+                        .or_else(|| filtered_frames.last());
 
                     if let Some(fr) = inspected {
                         cols[0].label(
@@ -384,7 +427,7 @@ impl eframe::App for SmtGuiApp {
                                 });
                             });
                     } else {
-                        cols[0].label(RichText::new("No frames captured yet.").color(Color32::GRAY));
+                        cols[0].label(RichText::new("No matching frames to inspect.").color(Color32::GRAY));
                     }
 
                     // Right column: Event & Discovery History
@@ -636,15 +679,147 @@ impl eframe::App for SmtGuiApp {
 
             ui.separator();
 
-            // 3C. Live Serial Frame Inspector with Byte-Diff Highlighting
+            // 3C. Stream Filter Toolbar & Live Serial Frame Inspector
+            egui::Frame::none()
+                .fill(Color32::from_rgb(26, 31, 40))
+                .rounding(4.0)
+                .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                .show(ui, |ui| {
+                    let mut new_filter: FrameFilter = filter_snapshot.clone();
+                    let mut changed = false;
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new("🔎 Stream Filter:")
+                                .color(Color32::from_rgb(0, 220, 255))
+                                .strong(),
+                        );
+
+                        // Hex / ASCII / Source text search
+                        let search_resp = ui.add(
+                            egui::TextEdit::singleline(&mut new_filter.search_query)
+                                .desired_width(150.0)
+                                .font(FontId::monospace(12.0))
+                                .hint_text("Hex/ASCII e.g. POLL or 02 30"),
+                        );
+                        if search_resp.changed() {
+                            changed = true;
+                        }
+
+                        ui.separator();
+
+                        // Port Filter: All or P1..PN
+                        ui.label(RichText::new("Port:").color(Color32::LIGHT_GRAY));
+                        if ui
+                            .selectable_label(new_filter.port_filter.is_none(), "All")
+                            .clicked()
+                        {
+                            new_filter.port_filter = None;
+                            changed = true;
+                        }
+                        for p in 1..=profile.port_count {
+                            if ui
+                                .selectable_label(
+                                    new_filter.port_filter == Some(p),
+                                    format!("P{p}"),
+                                )
+                                .clicked()
+                            {
+                                new_filter.port_filter = Some(p);
+                                changed = true;
+                            }
+                        }
+
+                        ui.separator();
+
+                        // Direction Filter
+                        ui.label(RichText::new("Direction:").color(Color32::LIGHT_GRAY));
+                        for dir_opt in DirectionFilter::ALL {
+                            if ui
+                                .selectable_label(
+                                    new_filter.direction == dir_opt,
+                                    dir_opt.as_str(),
+                                )
+                                .clicked()
+                            {
+                                new_filter.direction = dir_opt;
+                                changed = true;
+                            }
+                        }
+
+                        ui.separator();
+
+                        // Changed Bytes Only toggle (hide static heartbeats)
+                        if ui
+                            .checkbox(
+                                &mut new_filter.only_changed,
+                                RichText::new("⚡ Changed Bytes Only (Hide Static Heartbeats)")
+                                    .color(Color32::from_rgb(235, 130, 255)),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+
+                        ui.separator();
+
+                        // Min / Max payload byte length
+                        ui.label(RichText::new("Len(B):").color(Color32::LIGHT_GRAY));
+                        let min_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.min_len_input)
+                                .desired_width(36.0)
+                                .hint_text("Min"),
+                        );
+                        ui.label("..");
+                        let max_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.max_len_input)
+                                .desired_width(36.0)
+                                .hint_text("Max"),
+                        );
+                        if min_resp.changed() || max_resp.changed() {
+                            new_filter.min_len = self.min_len_input.trim().parse::<usize>().ok();
+                            new_filter.max_len = self.max_len_input.trim().parse::<usize>().ok();
+                            changed = true;
+                        }
+
+                        if new_filter.is_active() && ui.button("✖ Reset Filters").clicked() {
+                            new_filter.reset();
+                            self.min_len_input.clear();
+                            self.max_len_input.clear();
+                            changed = true;
+                        }
+                    });
+
+                    if changed {
+                        self.ctrl.state.lock().unwrap().filter = new_filter;
+                    }
+                });
+
+            ui.add_space(4.0);
+
             ui.horizontal(|ui| {
+                let status_badge = if stream_paused {
+                    format!(
+                        "⏸ PAUSED ({paused_skipped} background frames skipped) — Showing {} / {} buffered frames",
+                        filtered_frames.len(),
+                        total_frames
+                    )
+                } else {
+                    format!(
+                        "📡 Live Serial Packet Stream — Showing {} / {} buffered frames (Filter: {})",
+                        filtered_frames.len(),
+                        total_frames,
+                        filter_snapshot.summary()
+                    )
+                };
                 ui.label(
-                    RichText::new(format!(
-                        "📡 Live Serial Packet Stream ({} frames in rolling buffer — Magenta Byte = Changed Since Previous Frame)",
-                        frames.len()
-                    ))
-                    .color(Color32::from_rgb(0, 210, 255))
-                    .strong(),
+                    RichText::new(status_badge)
+                        .color(if stream_paused {
+                            Color32::from_rgb(255, 190, 60)
+                        } else {
+                            Color32::from_rgb(0, 210, 255)
+                        })
+                        .strong(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.checkbox(&mut self.auto_scroll, "Auto-scroll to latest");
@@ -655,7 +830,7 @@ impl eframe::App for SmtGuiApp {
                 .id_salt("packet_inspector_scroll")
                 .stick_to_bottom(self.auto_scroll)
                 .show(ui, |ui| {
-                    for fr in &frames {
+                    for fr in &filtered_frames {
                         let is_selected_frame = self.selected_frame_seq == Some(fr.seq);
                         let dir_col = if fr.direction.contains("CTRL→DEV")
                             || fr.direction.starts_with("P1")

@@ -30,6 +30,7 @@ enum PromptKind {
     InjectFrame,
     AnnotateLog,
     ChangeHostIp,
+    FilterSearch,
 }
 
 struct AppUiState {
@@ -62,7 +63,7 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
         .constraints([
             Constraint::Length(3),            // Top hardware & model auto-detection banner
             Constraint::Length(table_height), // Dynamic NPort Port Matrix (adapts to 1/2/4/8/16 ports)
-            Constraint::Length(4),            // Command & Keybinding Bar
+            Constraint::Length(5),            // Command, Stream Pause/Stop & Filter Keybinding Bar
             Constraint::Min(8),               // Live Byte-Diff & Checksum Frame Inspector
             Constraint::Length(5),            // Event Log / Modal Prompt
         ])
@@ -78,6 +79,18 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
                 .add_modifier(Modifier::BOLD),
         ),
         None => Span::styled(" ○ LOG: OFF ([l] Live / [w] Dump) ", Style::default().fg(Color::Gray)),
+    };
+
+    let pause_badge = if st.stream_paused {
+        Span::styled(
+            format!(" ⏸ PAUSED ({} skipped) ", st.paused_skipped_frames),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(" ▶ LIVE ", Style::default().fg(Color::Green))
     };
 
     let banner_line = Line::from(vec![
@@ -105,6 +118,7 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
             ),
             Style::default().fg(Color::White),
         ),
+        pause_badge,
         rec_badge,
     ]);
 
@@ -197,7 +211,7 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
     );
     frame.render_widget(ports_table, chunks[1]);
 
-    // 3. Keybinding & On-Demand Logging Control Bar
+    // 3. Keybinding, Pause/Stop Stream & Filter Control Bar
     let (pa, pb) = adjacent_port_pair(ui.selected_port, st.profile.port_count);
     let controls_text = vec![
         Line::from(vec![
@@ -216,19 +230,24 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
             ),
             Span::raw(" Connect  "),
             Span::styled(
-                "[b]",
+                "[Space]",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Baud  "),
+            Span::raw(" Pause/Resume  "),
             Span::styled(
-                "[f]",
+                "[s]",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Stop All  "),
+            Span::styled(
+                "[b/f]",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Framing  "),
+            Span::raw(" Baud/Frame  "),
             Span::styled(
                 "[d/r]",
                 Style::default()
@@ -236,18 +255,6 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" DTR/RTS  "),
-            Span::styled(
-                "[x]",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Flush  "),
-            Span::styled(
-                "[k]",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" BREAK  "),
             Span::styled(
                 "[i]",
                 Style::default()
@@ -258,38 +265,77 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
         ]),
         Line::from(vec![
             Span::styled(
+                "[/]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Search Filter  "),
+            Span::styled(
+                "[o]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" Dir({})  ", st.filter.direction.as_str())),
+            Span::styled(
+                "[h]",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                " ChangedOnly({})  ",
+                if st.filter.only_changed { "ON" } else { "OFF" }
+            )),
+            Span::styled(
+                "[y]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                " PortFilter({})  ",
+                st.filter
+                    .port_filter
+                    .map(|p| format!("P{p}"))
+                    .unwrap_or_else(|| String::from("ALL"))
+            )),
+            Span::styled(
+                "[z]",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Reset Filters"),
+        ]),
+        Line::from(vec![
+            Span::styled(
                 "[l]",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Toggle Live Log  "),
+            Span::raw(" Live Log  "),
             Span::styled(
                 "[w]",
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Dump Buffer to Log Now  "),
+            Span::raw(" Dump Log  "),
             Span::styled(
                 "[n]",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Add Log Note  "),
+            Span::raw(" Note  "),
             Span::styled(
-                "[t]",
+                "[t/v]",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!(" Tap(P{pa}+P{pb})  ")),
-            Span::styled(
-                "[v]",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(" MITM(P{pa}⟷P{pb})  ")),
+            Span::raw(format!(" Tap/MITM(P{pa}⟷P{pb})  ")),
             Span::styled(
                 "[a]",
                 Style::default()
@@ -323,7 +369,7 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
     let controls_block = Paragraph::new(controls_text).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Hardware, Sniffing & On-Demand Logging Controls "),
+            .title(" Stream Pause/Stop, Multi-Option Filtering, Sniffing & Logging Controls "),
     );
     frame.render_widget(controls_block, chunks[2]);
 
@@ -383,6 +429,23 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
             );
             frame.render_widget(prompt, chunks[4]);
         }
+        PromptKind::FilterSearch => {
+            let prompt = Paragraph::new(format!(
+                "Filter Stream by Hex / ASCII / Source (leave empty to clear search filter): {}█",
+                ui.input_buffer
+            ))
+            .style(
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Set Stream Search Filter (Enter = Apply, Esc = Cancel) "),
+            );
+            frame.render_widget(prompt, chunks[4]);
+        }
         PromptKind::None => {
             let logs: Vec<Line> = st
                 .status_log
@@ -395,7 +458,7 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
                         Style::default().fg(Color::Red)
                     } else if entry.contains("OPERATOR NOTE") || entry.contains("Dumped") || entry.contains("Live stream logging ON") {
                         Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                    } else if entry.contains("NOTE:") {
+                    } else if entry.contains("NOTE:") || entry.contains("PAUSED") {
                         Style::default().fg(Color::Yellow)
                     } else {
                         Style::default().fg(Color::Gray)
@@ -419,7 +482,9 @@ fn render_frame_inspector(
     st: &nport5610_core::SharedEngineState,
 ) {
     let max_rows = area.height.saturating_sub(3) as usize;
-    let visible: Vec<_> = st.frames.iter().rev().take(max_rows).rev().collect();
+    let matching = st.filtered_frames();
+    let total = st.frames.len();
+    let visible: Vec<_> = matching.iter().rev().take(max_rows).rev().collect();
 
     let mut lines = Vec::with_capacity(visible.len() + 1);
     lines.push(Line::from(vec![Span::styled(
@@ -489,11 +554,13 @@ fn render_frame_inspector(
         lines.push(Line::from(spans));
     }
 
-    let block = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Live Framed Serial Packet Inspector (Magenta Byte = Changed Since Previous Frame) "),
+    let title = format!(
+        " Packet Inspector — Showing {}/{} frames | Filter: {} ",
+        matching.len(),
+        total,
+        st.filter.summary()
     );
+    let block = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(block, area);
 }
 
@@ -647,28 +714,34 @@ async fn run_event_loop(
                     let raw = ui.input_buffer.trim().to_string();
                     let mode = std::mem::replace(&mut ui.prompt_kind, PromptKind::None);
                     ui.input_buffer.clear();
-                    if !raw.is_empty() {
-                        match mode {
-                            PromptKind::InjectFrame => match parse_payload_input(&raw) {
+                    match mode {
+                        PromptKind::FilterSearch => {
+                            let mut st = ctrl.state.lock().unwrap();
+                            st.filter.search_query = raw.clone();
+                            let summary = st.filter.summary();
+                            st.log_event(format!("Updated stream filter -> {summary}"));
+                        }
+                        PromptKind::InjectFrame if !raw.is_empty() => {
+                            match parse_payload_input(&raw) {
                                 Ok(bytes) => ctrl.inject_payload(ui.selected_port, bytes).await,
                                 Err(e) => ctrl
                                     .state
                                     .lock()
                                     .unwrap()
                                     .log_event(format!("ERROR parsing payload: {e}")),
-                            },
-                            PromptKind::AnnotateLog => {
-                                ctrl.state.lock().unwrap().annotate_log(&raw);
                             }
-                            PromptKind::ChangeHostIp => {
-                                ctrl.switch_target_host(&raw).await;
-                                let new_max = ctrl.state.lock().unwrap().profile.port_count;
-                                if ui.selected_port > new_max {
-                                    ui.selected_port = new_max;
-                                }
-                            }
-                            PromptKind::None => {}
                         }
+                        PromptKind::AnnotateLog if !raw.is_empty() => {
+                            ctrl.state.lock().unwrap().annotate_log(&raw);
+                        }
+                        PromptKind::ChangeHostIp if !raw.is_empty() => {
+                            ctrl.switch_target_host(&raw).await;
+                            let new_max = ctrl.state.lock().unwrap().profile.port_count;
+                            if ui.selected_port > new_max {
+                                ui.selected_port = new_max;
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 KeyCode::Backspace => {
@@ -685,6 +758,47 @@ async fn run_event_loop(
         let max_ports = { ctrl.state.lock().unwrap().profile.port_count };
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => break,
+            KeyCode::Char(' ') => {
+                ctrl.state.lock().unwrap().toggle_pause();
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                ctrl.stop_all_streams();
+            }
+            KeyCode::Char('/') => {
+                ui.prompt_kind = PromptKind::FilterSearch;
+                ui.input_buffer = ctrl.state.lock().unwrap().filter.search_query.clone();
+            }
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                let mut st = ctrl.state.lock().unwrap();
+                st.filter.direction = st.filter.direction.next();
+                let dir_str = st.filter.direction.as_str();
+                st.log_event(format!("Direction filter set to: {dir_str}"));
+            }
+            KeyCode::Char('h') | KeyCode::Char('H') => {
+                let mut st = ctrl.state.lock().unwrap();
+                st.filter.only_changed = !st.filter.only_changed;
+                let state_str = if st.filter.only_changed {
+                    "ON (Hiding static heartbeats)"
+                } else {
+                    "OFF (Showing all frames)"
+                };
+                st.log_event(format!("Changed-Bytes-Only filter: {state_str}"));
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let mut st = ctrl.state.lock().unwrap();
+                if st.filter.port_filter == Some(ui.selected_port) {
+                    st.filter.port_filter = None;
+                    st.log_event("Port filter set to: ALL ports");
+                } else {
+                    st.filter.port_filter = Some(ui.selected_port);
+                    st.log_event(format!("Port filter locked to: Port {}", ui.selected_port));
+                }
+            }
+            KeyCode::Char('z') | KeyCode::Char('Z') => {
+                let mut st = ctrl.state.lock().unwrap();
+                st.filter.reset();
+                st.log_event("Reset all stream filters (showing all frames)");
+            }
             KeyCode::Char(c @ '1'..='8') => {
                 let p = (c as u8) - b'0';
                 if p <= max_ports {

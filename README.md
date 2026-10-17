@@ -11,7 +11,7 @@ This repository contains the **Rust (`tokio` + `ratatui`)** production backend, 
   * **Automatic Moxa Hardware Model & Port-Count Detection (`auto_detect_nport_model`):** Queries the target Moxa IP via **UDP Port 4800 (Moxa DSU `0x01` Identify)**, **HTTP Port 80 Web Banner**, and **Active TCP/ASPP Port-Range Scanning (`4001..4016` & `966..981`)** to automatically identify the model (`NPort 5610-8-DT`, `5650-8-DT`, `5450`, `5410`, `5250A`, `5210A`, `5110`, etc.), port count (`1`, `2`, `4`, `8`, or `16`), electrical interface (`RS-232` vs `RS-232/422/485`), and connector pinout (`DB9 Male` vs `8-Pin RJ45`).
   * **Moxa ASPP Hardware Command Plane (`TCP 966..981`):** Live UART configuration (`1200`–`230400` baud, `8N1`/`8E1`/`8O1`/`7E1`/`8N2`/`8M1`/`8S1`), physical `DTR`/`RTS` output pin toggling (`0x12`), live `CTS`/`DSR`/`DCD`/`RI` input polling (`0x13`), hardware FIFO flushing (`0x14`), and `BREAK` pulse generation (`0x15`/`0x21`).
   * **Low-Latency Serial Data & Sniffing Engine (`TCP 4001..4016`):** Microsecond inter-frame gap packetisation, **Passive Dual-RX Tapping**, **Active Man-in-the-Middle (MITM) Bridging**, **Byte-Diff Tracking** (automatically flags which byte offsets changed between consecutive frames), and real-time `XOR8`, `LRC`, and `CRC-16/MODBUS` calculation.
-* **[`crates/smt-gui/`](crates/smt-gui/)** — Native Wayland/X11 desktop GUI (`smt-gui` built with `eframe`/`egui`). Features live IP switching, UDP 4800 LAN discovery badges, adaptive multi-port LED status matrix, one-click Passive Tap & Active MITM controls, on-demand stream/buffer logging, and a click-to-inspect **Byte & Bit Dissector Drawer**.
+* **[`crates/smt-gui/`](crates/smt-gui/)** — Native Wayland/X11 desktop GUI (`smt-gui` built with `eframe`/`egui`). Features live IP switching, UDP 4800 LAN discovery badges, adaptive multi-port LED status matrix, **Pause/Resume Stream**, **Stop All Streams**, a multi-option **Stream Filter Toolbar** (Hex/ASCII search, Port filter, Direction filter, Changed-Bytes-Only to hide static heartbeats, and Min/Max length), one-click Passive Tap & Active MITM controls, on-demand stream/buffer logging, and a click-to-inspect **Byte & Bit Dissector Drawer**.
 * **[`crates/smt-tui/`](crates/smt-tui/)** — Compiled `ratatui` operator and protocol-sniffing terminal console (`smt-tui`). Ideal for terminal windows or SSH sessions, dynamically adapting its layout to the detected Moxa NPort model.
 * **[`crates/smt-daemon/`](crates/smt-daemon/)** — 24/7 headless background service (`smt-daemon`) and local JSON IPC server (`127.0.0.1:7450`), packaged with [`deploy/smt-daemon.service`](deploy/smt-daemon.service).
 
@@ -29,7 +29,7 @@ This repository contains the **Rust (`tokio` + `ratatui`)** production backend, 
 ```bash
 cd ~/Projects/smt-control-system
 
-# Run unit tests (ASPP codecs, model auto-detection, CRC-16/MODBUS, payload parsers)
+# Run unit tests (ASPP codecs, model auto-detection, CRC-16/MODBUS, stream filters & pause)
 cargo test --workspace
 
 # Build optimised release binaries (smt-gui, smt-tui, and smt-daemon)
@@ -60,6 +60,12 @@ cargo build --release
 | :--- | :--- |
 | **`1`–`8`** or **`↑`/`↓`** | Select active serial port (`P1` through `P8`, adapting automatically to detected port count) |
 | **`c`** | Connect / Disconnect raw TCP Data stream (`:4001+`) on the selected port |
+| **`Space`** | **Pause / Resume Stream** (freezes the live packet inspector for analysis whilst tracking skipped background frames) |
+| **`s`** | **Stop All Streams** (disconnects all active serial streams across all ports at once) |
+| **`/`** | **Search Filter** (filter stream by Hex bytes, ASCII text, or source label, e.g. `POLL` or `02 30`) |
+| **`o`** | **Cycle Direction Filter** (`All Directions` → `CTRL→DEV Only` → `DEV→CTRL Only` → `TX Injected Only`) |
+| **`h`** | **Toggle Changed-Bytes-Only Filter** (hides static repeating heartbeat frames where no bytes changed) |
+| **`y`** / **`z`** | Lock **Port Filter** to the currently selected port (`y`) or **Reset All Filters** (`z`) |
 | **`b`** / **`f`** | Cycle Baud Rate (`1200`–`230400`) or UART Framing (`8N1`, `8E1`, `8O1`, `7E1`, `8M1`, etc.) via ASPP `0x10` |
 | **`d`** / **`r`** | Toggle physical **`DTR`** (Pin 4) or **`RTS`** (Pin 7) output pin (`ON` / `OFF`) via ASPP `0x12` |
 | **`x`** / **`k`** | Flush hardware UART TX/RX FIFOs (`0x14`) or transmit a `250 ms` RS-232 `BREAK` pulse (`0x15`/`0x21`) |
@@ -68,7 +74,7 @@ cargo build --release
 | **`i`** | **Inject / Transmit Frame** (enter ASCII e.g. `\x0201POLL\x03` or Hex e.g. `hex:02 30 31 03`) |
 | **`a`** | **Set Moxa IP Address** (enter a new IP e.g. `192.168.1.250` or `demo` to connect and auto-detect the new Moxa model) |
 | **`l`** | **Toggle Live Stream Log** on/off (writes real-time frames to `logs/nport_stream_*.log` and `.jsonl`) |
-| **`w`** | **Dump Buffer to Log Now** (instantly writes up to 500 buffered frames from memory to `logs/nport_dump_*.log` and `.jsonl`) |
+| **`w`** | **Dump Buffer to Log Now** (instantly writes all currently matching filtered frames from memory to `logs/nport_dump_*.log` and `.jsonl`) |
 | **`n`** | **Add Operator Note** (injects a timestamped `=== OPERATOR NOTE ===` marker into the active stream log) |
 | **`p`** | Poll target IP to **Auto-Detect Moxa Model** and refresh `CTS`/`DSR`/`DCD` hardware input lines |
 | **`u`** | Broadcast **Moxa UDP 4800 Discovery** to find all NPort units on the LAN |
