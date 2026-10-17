@@ -48,9 +48,9 @@ def check_tcp_port(host: str, port: int, timeout: float = 0.8) -> bool:
         return False
 
 
-def probe_nport(host: str, max_ports: int = 4) -> None:
-    """Scan common Moxa NPort management, Real COM, and TCP Server ports."""
-    print(f"[*] Probing Moxa NPort at {host} ...")
+def probe_nport(host: str, max_ports: int = 8) -> None:
+    """Scan common Moxa NPort 5610-8-DT management, Real COM, and TCP Server ports."""
+    print(f"[*] Probing Moxa NPort 5610-8-DT at {host} ...")
     mgmt_ports = [
         (80, "HTTP Web Console"),
         (443, "HTTPS Web Console"),

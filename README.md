@@ -1,75 +1,69 @@
 # SMT Control System Modernisation (`smt-control-system`)
 
-This repository contains the architectural documentation, reverse-engineering methodology, and diagnostic capture tooling for modernising the legacy RS-232 SMT control system into a Linux-based Ethernet-connected architecture using a **4-Port Moxa NPort 5450** serial device server.
+This repository contains the architectural documentation, reverse-engineering methodology, clean control protocol stack (`nport5610`), and interactive 8-port Terminal User Interface (`nport_tui.py`) for modernising the legacy RS-232 SMT control system using an **8-Port Moxa NPort 5610-8-DT** serial device server.
 
 ---
 
 ## Repository Structure
 
-* **[`docs/01-moxa-linux-architecture.md`](docs/01-moxa-linux-architecture.md)** — Comprehensive guide to interfacing a Linux application with an Ethernet-connected Moxa serial device (Direct TCP/UDP Socket Mode, RFC 2217, Moxa `npreal2` Real TTY driver, and `socat` user-space PTY bridges).
+* **[`nport5610/`](nport5610/)** — Pure-Python, driverless protocol & control package for the **Moxa NPort 5610-8-DT**:
+  * [`nport5610/protocol.py`](nport5610/protocol.py) — Implements Moxa **UDP 4800 Broadcast Discovery**, **ASPP (Async Server Private Protocol) Command Ports (`:966`–`:973`)** for live UART configuration (`1200`–`230400` baud, `8N1`/`8E1`/`7E1`/`8M1`, `DTR`/`RTS` toggling, `CTS`/`DSR`/`DCD` polling, FIFO flushing, and `BREAK` signalling), and **Raw TCP Data Streaming (`:4001`–`:4008`)** with built-in **Passive Dual-RX Tapping** and **Active MITM Bridging**.
+* **[`tools/nport_tui.py`](tools/nport_tui.py)** — Full-screen interactive 8-port `curses` TUI to control, monitor, passive-tap, MITM-bridge, auto-baud scan, and inject frames across all 8 RS-232 ports of a Moxa NPort 5610-8-DT.
+* **[`tools/serial_tap_logger.py`](tools/serial_tap_logger.py)** — Headless CLI dual-channel RS-232 passive tap and active MITM logger supporting Moxa TCP Server sockets (`tcp://<ip>:4001`) and local `/dev/tty*` ports.
+* **[`tools/nport_probe.py`](tools/nport_probe.py)** — Headless CLI port scanner and ASPP (`:966`–`:973`) automatic baud-rate scanner across all 8 ports.
+* **[`docs/01-moxa-linux-architecture.md`](docs/01-moxa-linux-architecture.md)** — Guide to interfacing a Linux application with an Ethernet-connected Moxa serial device (Direct TCP/UDP Socket Mode, RFC 2217, Moxa `npreal2` Real TTY driver, and `socat` user-space PTY bridges).
 * **[`docs/02-rs232-sniffing-and-protocol-analysis.md`](docs/02-rs232-sniffing-and-protocol-analysis.md)** — Engineering handbook for non-intrusively tapping, capturing, and reverse-engineering bidirectional RS-232 serial traffic between two legacy devices.
-* **[`docs/03-nport-configuration-and-wiring.md`](docs/03-nport-configuration-and-wiring.md)** — Dedicated **Moxa NPort 5450** playbook: DB9 Male RS-232/422/485 pinout table, mandatory `Interface = RS-232` check, 4-port allocation strategy, passive dual-RX & active MITM topologies, Web UI latency tuning (`Force Transmit`, `FIFO`, `Max Connection = 2`), and out-of-band ASPP Command Port (`966`–`969`) control.
-* **[`tools/serial_tap_logger.py`](tools/serial_tap_logger.py)** — Dual-channel RS-232 passive tap and active MITM logger supporting both Moxa TCP Server sockets (`tcp://<ip>:4001`) and local `/dev/tty*` interfaces, with microsecond timestamping, automatic inter-frame silence detection, colourised Hex + ASCII output, and JSONL structured logging.
-* **[`tools/nport_probe.py`](tools/nport_probe.py)** — Moxa NPort 5450 network port scanner and automatic baud-rate detector using the NPort's ASPP Command Ports (`966`–`969`) and TCP Data Ports (`4001`–`4004`).
+* **[`docs/03-nport-configuration-and-wiring.md`](docs/03-nport-configuration-and-wiring.md)** — Dedicated **Moxa NPort 5610-8-DT** specification: ASPP byte-level protocol tables, DB9 Male & RJ45 (`-J`) pinouts, 8-port allocation strategy, Web UI latency tuning (`Force Transmit`, `FIFO`, `Max Connection = 2`), and TUI operator manual.
 
 ---
 
-## Quick-Start: Moxa NPort 5450 Setup & Capture
+## Quick-Start: Controlling the Moxa NPort 5610-8-DT
 
-### 1. Mandatory NPort 5450 Pre-Flight Check
-Each port on the **NPort 5450** supports RS-232, RS-422, and RS-485 on the same DB9 Male connector. Before connecting any serial cables:
-1. Open the NPort 5450 Web Console (default `192.168.127.254`) or use the top-panel LCM display.
-2. Under **Serial Settings → Port 1–4**, verify **`Interface = RS-232`** on all four ports (in RS-422 mode, DB9 Pin 2 is a driven output; in RS-232 mode, Pin 2 is `RXD` input, Pin 3 is `TXD` output, and Pin 5 is `GND`).
-3. Under **Operating Settings → Port 1–4**, set:
-   * **Operation Mode:** `TCP Server Mode` (Ports `4001`–`4004`)
-   * **Force Transmit:** `1 ms` or `2 ms`
-   * **FIFO:** `Disable` (while sniffing at ≤19,200 baud)
-   * **Flow Control:** `None` (on Passive Tap Ports 1 & 2)
-   * **Max Connection:** `2` (with **Ignore Jammed IP:** `Yes`)
+### 1. Launch the Interactive 8-Port TUI (`tools/nport_tui.py`)
+```bash
+# Connect to a live Moxa NPort 5610-8-DT on your network:
+./tools/nport_tui.py 192.168.127.254
 
-### 2. Recommended 4-Port Allocation on the NPort 5450
+# Or launch immediately in offline Demo / Simulation mode (with simulated legacy SMT traffic):
+./tools/nport_tui.py --demo
+```
 
-| NPort 5450 Port | TCP Data Port | ASPP Cmd Port | Role | Physical Wiring (DB9 Male) |
+Inside the TUI:
+* **`1`–`8`** / **`↑`/`↓`**: Select any of the 8 RS-232 ports (`P1 :4001` through `P8 :4008`).
+* **`t`**: Start **Passive Dual-RX Tap** on the selected port pair (`P1+P2`, `P3+P4`, `P5+P6`, `P7+P8`).
+* **`m`**: Start **Active MITM Bridge** on the selected port pair (`P1⟷P2`, `P3⟷P4`, `P5⟷P6`, `P7⟷P8`).
+* **`b`** / **`f`**: Cycle Baud Rate (`1200`–`230400`) and Framing (`8N1`, `8E1`, `8O1`, `7E1`, `8M1`, etc.) live over ASPP (`:966`–`:973`).
+* **`d`** / **`r`**: Toggle physical **`DTR`** (Pin 4) and **`RTS`** (Pin 7) output lines live over ASPP (`0x12`).
+* **`x`** / **`k`**: Flush hardware UART FIFOs (`0x14`) or transmit a `250 ms` RS-232 `BREAK` pulse (`0x15`/`0x21`).
+* **`i`**: Inject/transmit an ASCII (`\x0201POLL\x03`) or Hex (`hex:02 30 31 03`) frame out of the selected port.
+* **`s`**: Run automatic ASPP **Baud-Rate Scanner** on the selected port.
+* **`u`**: Broadcast **UDP Port 4800 Discovery** to find NPort 5610-8-DT units on the LAN.
+* **`l`**: Toggle live structured **`.jsonl` packet capture recording**.
+
+---
+
+### 2. Recommended 8-Port Allocation on the NPort 5610-8-DT
+
+All 8 rear-panel DB9 Male ports on the **NPort 5610-8-DT** are pure RS-232 DTE (`Pin 2 = RXD`, `Pin 3 = TXD`, `Pin 5 = GND`, `Pin 4 = DTR`, `Pin 7 = RTS`, `Pin 8 = CTS`, `Pin 6 = DSR`, `Pin 1 = DCD`):
+
+| NPort 5610-8-DT Port | TCP Data | ASPP Cmd | Role | Physical Wiring (DB9 Male) |
 | :--- | :--- | :--- | :--- | :--- |
-| **Port 1** | `:4001` | `:966` | **Passive Tap A (`CTRL → DEV`)** | `Pin 2 (RXD)` tapped onto Legacy Controller `TXD`; `Pin 5` to shared `GND`; `Pin 3 (TXD)` disconnected. |
-| **Port 2** | `:4002` | `:967` | **Passive Tap B (`DEV → CTRL`)** | `Pin 2 (RXD)` tapped onto Target SMT Device `TXD`; `Pin 5` to shared `GND`; `Pin 3 (TXD)` disconnected. |
-| **Port 3** | `:4003` | `:968` | **New Linux Control / MITM Port A** | Full RS-232 cable (`Pins 2, 3, 5, 7, 8`) ready to plug into the SMT Device during active testing. |
-| **Port 4** | `:4004` | `:969` | **Device Emulator / MITM Port B** | Full RS-232 cable (with Null-Modem adapter) ready to plug into the Legacy Controller. |
-
-### 3. Probe the NPort 5450 & Auto-Scan Unknown Baud Rates
-```bash
-# Check active TCP Server / ASPP ports on the NPort 5450
-./tools/nport_probe.py 192.168.127.254
-
-# Dynamically scan standard baud rates (1200..115200) on Port 1 via ASPP Command Port 966
-./tools/nport_probe.py 192.168.127.254 --port 1 --scan-baud
-```
-
-### 4. Record Bidirectional Traffic (Passive Tap on Ports 1 & 2)
-```bash
-./tools/serial_tap_logger.py \
-  --port-a tcp://192.168.127.254:4001 \
-  --port-b tcp://192.168.127.254:4002 \
-  --gap-ms 5 \
-  -o smt_baseline_capture.jsonl
-```
-
-### 5. Run Active Man-in-the-Middle Bridge (Ports 3 & 4)
-```bash
-./tools/serial_tap_logger.py \
-  --mitm \
-  --port-a tcp://192.168.127.254:4003 \
-  --port-b tcp://192.168.127.254:4004 \
-  --gap-ms 5 \
-  -o smt_mitm_capture.jsonl
-```
+| **Port 1** | `:4001` | `:966` | **Passive Tap 1A (`CTRL → DEV`)** | `Pin 2 (RXD)` tapped onto Link 1 Controller `TXD`; `Pin 5` to shared `GND`; `Pin 3` NC. |
+| **Port 2** | `:4002` | `:967` | **Passive Tap 1B (`DEV → CTRL`)** | `Pin 2 (RXD)` tapped onto Link 1 SMT Device `TXD`; `Pin 5` to shared `GND`; `Pin 3` NC. |
+| **Port 3** | `:4003` | `:968` | **New Linux Control / MITM Port A** | Full RS-232 cable (`Pins 2, 3, 5, 7, 8`) to Target SMT Device #1. |
+| **Port 4** | `:4004` | `:969` | **Device Emulator / MITM Port B** | Full RS-232 cable (with Null-Modem adapter) to Legacy Controller #1. |
+| **Port 5** | `:4005` | `:970` | **Passive Tap 2A (`CTRL → DEV`)** | `Pin 2 (RXD)` tapped onto Link 2 Controller `TXD` (for multi-channel SMT machines). |
+| **Port 6** | `:4006` | `:971` | **Passive Tap 2B (`DEV → CTRL`)** | `Pin 2 (RXD)` tapped onto Link 2 SMT Device `TXD`. |
+| **Port 7** | `:4007` | `:972` | **Production / Auxiliary Port 7** | Additional RS-232 control channel. |
+| **Port 8** | `:4008` | `:973` | **Loopback Self-Test / Spare Port 8** | Can bridge `P7 ⟷ P8` for hardware-in-the-loop protocol validation. |
 
 ---
 
-## Modernisation Roadmap
-
-1. **Phase 1: Electrical & Physical Layer Discovery** — Verify DB9 pinouts, voltage swings (±3 V to ±15 V), hardware handshaking lines (`RTS`/`CTS`, `DTR`/`DSR`), and framing parameters (`nport_probe.py --scan-baud` or logic analyser).
-2. **Phase 2: Passive Line Tapping & Traffic Capture** — Tap both directions into NPort 5450 **Port 1 (`RXD`)** and **Port 2 (`RXD`)**, confirm **Orange/Amber `Rx` LEDs** blink on both ports, and capture correlated stimulus-response sessions via [`tools/serial_tap_logger.py`](tools/serial_tap_logger.py).
-3. **Phase 3: Protocol Reverse-Engineering** — Analyse frame boundaries, background heartbeat polls, command opcodes, numeric encodings, and checksum/CRC algorithms (`XOR`, `LRC`, or 16-bit CRC via `reveng`).
-4. **Phase 4: Active Proxy & Emulation** — Bridge the Legacy Controller and SMT Device through NPort 5450 **Ports 3 & 4** in `--mitm` mode to validate decoded packets and state machines.
-5. **Phase 5: Native Linux Control Application** — Replace the legacy controller with the modern Linux control service communicating over Ethernet to the NPort 5450 (`:4001` / `:4003`), keeping `Max Connection = 2` so diagnostic tooling can attach live at any time.
+### 3. NPort 5610-8-DT Web UI Settings Checklist
+Under **Operating Settings** and **Serial Settings** for **Ports 1–8**:
+* **Operation Mode:** `TCP Server Mode` (Ports `4001`–`4008`)
+* **Allow Driver Control:** `Yes` (enables ASPP Command Ports `966`–`973` for live baud/framing/pin control)
+* **Force Transmit:** `1 ms` or `2 ms` (preserves binary packet boundaries over Ethernet)
+* **FIFO:** `Disable` (while sniffing at ≤19,200 baud)
+* **Flow Control:** `None` (on Passive Tap Ports 1, 2, 5, 6)
+* **Max Connection:** `2` with **Ignore Jammed IP:** `Yes` (allows the production service and `nport_tui.py` to attach to the same port simultaneously)
