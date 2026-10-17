@@ -4,8 +4,14 @@
 //! Wayland desktop SMT control software):
 //!   1. Automatically polls and identifies the Moxa NPort hardware model (`5610-8-DT`, `5450`, etc.).
 //!   2. Supervises persistent TCP Data (`4001..`) and ASPP (`966..`) channels.
-//!   3. Exposes a local JSON IPC socket (`127.0.0.1:7450`) so the Wayland SMT control GUI
-//!      or external tools can read live hardware telemetry and inject serial commands.
+//!   3. Exposes a local IPC socket (`127.0.0.1:7450`) supporting:
+//!      - `STATUS`            -> JSON snapshot of model, ports, and recent frames
+//!      - `HOST <ip>`         -> Switch target Moxa IP address at runtime and auto-detect model
+//!      - `LOG [label]`       -> Toggle live stream logging to `logs/*.log` + `.jsonl`
+//!      - `DUMP [label]`      -> Immediately dump buffered frames to `logs/*.log` + `.jsonl` on demand
+//!      - `NOTE <text>`       -> Write a timestamped operator note into the log
+//!      - `STREAM`            -> Stream every serial frame live to the client on demand
+//!      - `SEND <port> <raw>` -> Transmit ASCII or `hex:...` frame out of a port
 
 use std::time::Duration;
 
@@ -24,6 +30,7 @@ struct DaemonStatusSnapshot {
     connector: String,
     discovery_method: String,
     mode_banner: String,
+    active_log_file: Option<String>,
     ports: Vec<nport5610_core::PortState>,
     recent_frames: Vec<nport5610_core::SerialFrame>,
 }
@@ -75,7 +82,7 @@ async fn main() -> Result<()> {
     }
 
     let listener = TcpListener::bind(&ipc_addr).await?;
-    println!("[smt-daemon] Local Wayland GUI / IPC JSON server listening on {ipc_addr}");
+    println!("[smt-daemon] Local Wayland GUI / IPC server listening on {ipc_addr}");
 
     let ctrl_ipc = ctrl.clone();
     tokio::spawn(async move {
@@ -100,14 +107,73 @@ async fn main() -> Result<()> {
                                 connector: st.profile.connector.clone(),
                                 discovery_method: st.discovery_method.clone(),
                                 mode_banner: st.mode_banner.clone(),
+                                active_log_file: st
+                                    .text_log_path
+                                    .as_ref()
+                                    .map(|p| p.display().to_string()),
                                 ports: st.ports.clone(),
-                                recent_frames: st.frames.iter().rev().take(20).rev().cloned().collect(),
+                                recent_frames: st
+                                    .frames
+                                    .iter()
+                                    .rev()
+                                    .take(20)
+                                    .rev()
+                                    .cloned()
+                                    .collect(),
                             };
                             serde_json::to_string(&snap).unwrap_or_default()
                         };
                         let _ = writer.write_all(format!("{json_reply}\n").as_bytes()).await;
+                    } else if let Some(new_ip) = cmd.strip_prefix("HOST ") {
+                        ctrl_conn.switch_target_host(new_ip).await;
+                        let reply = {
+                            let st = ctrl_conn.state.lock().unwrap();
+                            serde_json::json!({
+                                "ok": true,
+                                "host": st.host,
+                                "model": st.profile.model_name,
+                                "ports": st.profile.port_count
+                            })
+                            .to_string()
+                        };
+                        let _ = writer.write_all(format!("{reply}\n").as_bytes()).await;
+                    } else if cmd.eq_ignore_ascii_case("DUMP") || cmd.starts_with("DUMP ") {
+                        let lbl = cmd.strip_prefix("DUMP").map(str::trim).filter(|s| !s.is_empty());
+                        let path = ctrl_conn.state.lock().unwrap().dump_buffer_on_demand(lbl);
+                        let reply = serde_json::json!({
+                            "ok": path.is_some(),
+                            "dump_file": path.map(|p| p.display().to_string())
+                        })
+                        .to_string();
+                        let _ = writer.write_all(format!("{reply}\n").as_bytes()).await;
+                    } else if cmd.eq_ignore_ascii_case("LOG") || cmd.starts_with("LOG ") {
+                        let lbl = cmd.strip_prefix("LOG").map(str::trim).filter(|s| !s.is_empty());
+                        let path = ctrl_conn.state.lock().unwrap().toggle_jsonl(lbl);
+                        let reply = serde_json::json!({
+                            "logging_active": path.is_some(),
+                            "log_file": path.map(|p| p.display().to_string())
+                        })
+                        .to_string();
+                        let _ = writer.write_all(format!("{reply}\n").as_bytes()).await;
+                    } else if let Some(note) = cmd.strip_prefix("NOTE ") {
+                        ctrl_conn.state.lock().unwrap().annotate_log(note);
+                        let _ = writer.write_all(b"{\"ok\":true}\n").await;
+                    } else if cmd.eq_ignore_ascii_case("STREAM") {
+                        let mut rx = {
+                            let st = ctrl_conn.state.lock().unwrap();
+                            st.frame_tx.subscribe()
+                        };
+                        let _ = writer
+                            .write_all(b"# Streaming live Moxa serial frames (Ctrl+C to stop)...\n")
+                            .await;
+                        while let Ok(fr) = rx.recv().await {
+                            let line = format!("{}\n", fr.format_log_line());
+                            if writer.write_all(line.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        }
+                        break;
                     } else if let Some(rest) = cmd.strip_prefix("SEND ") {
-                        // Format: SEND <port_num> <payload>
                         let mut parts = rest.splitn(2, ' ');
                         if let (Some(p_str), Some(payload_str)) = (parts.next(), parts.next()) {
                             if let (Ok(p), Ok(bytes)) =
@@ -127,7 +193,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Periodic hardware health and model/modem polling loop
     let ctrl_poll = ctrl.clone();
     tokio::spawn(async move {
         loop {

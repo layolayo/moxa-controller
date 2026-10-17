@@ -1,7 +1,8 @@
 //! `smt-tui` — High-frame-rate `ratatui` Operator & Reverse-Engineering Console
 //! for Moxa NPort Serial Device Servers (`NPort 5610-8-DT`, `5450`, `5250A`, `5110`, etc.).
 //!
-//! Designed to run alongside the main SMT Wayland desktop control software or over SSH.
+//! Includes on-demand stream logging (`[l]`), instant rolling-buffer dump to disk (`[w]`),
+//! and live operator log annotations (`[n]`).
 
 use std::io;
 use std::time::Duration;
@@ -23,9 +24,17 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
 
+#[derive(PartialEq, Eq)]
+enum PromptKind {
+    None,
+    InjectFrame,
+    AnnotateLog,
+    ChangeHostIp,
+}
+
 struct AppUiState {
     selected_port: u8,
-    input_mode: bool,
+    prompt_kind: PromptKind,
     input_buffer: String,
     demo_model_idx: usize,
 }
@@ -34,7 +43,7 @@ impl AppUiState {
     fn new() -> Self {
         Self {
             selected_port: 1,
-            input_mode: false,
+            prompt_kind: PromptKind::None,
             input_buffer: String::new(),
             demo_model_idx: 0,
         }
@@ -55,34 +64,45 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
             Constraint::Length(table_height), // Dynamic NPort Port Matrix (adapts to 1/2/4/8/16 ports)
             Constraint::Length(4),            // Command & Keybinding Bar
             Constraint::Min(8),               // Live Byte-Diff & Checksum Frame Inspector
-            Constraint::Length(5),            // Event Log / Frame Injection Prompt
+            Constraint::Length(5),            // Event Log / Modal Prompt
         ])
         .split(frame.area());
 
     // 1. Top Hardware & Model Auto-Detection Banner
-    let rec_badge = match &st.jsonl_path {
+    let rec_badge = match &st.text_log_path {
         Some(p) => Span::styled(
-            format!(" ● REC: {} ", p.display()),
-            Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD),
+            format!(" ● LOGGING: {} ", p.display()),
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
         ),
-        None => Span::styled(
-            " ○ REC: OFF ",
-            Style::default().fg(Color::Gray),
-        ),
+        None => Span::styled(" ○ LOG: OFF ([l] Live / [w] Dump) ", Style::default().fg(Color::Gray)),
     };
 
     let banner_line = Line::from(vec![
         Span::styled(
-            format!(" {} ({}-Port {}) ", st.profile.model_name, st.profile.port_count, st.profile.interfaces),
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            format!(
+                " {} ({}-Port {}) ",
+                st.profile.model_name, st.profile.port_count, st.profile.interfaces
+            ),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(
             format!("Host: {} ", st.host),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("| Connector: {} | Detected via: {} | Mode: {} ", st.profile.connector, st.discovery_method, st.mode_banner),
+            format!(
+                "| {} | Via: {} | Mode: {} ",
+                st.profile.connector, st.discovery_method, st.mode_banner
+            ),
             Style::default().fg(Color::White),
         ),
         rec_badge,
@@ -108,7 +128,13 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
         "TX (Frames/Bytes)",
     ]
     .into_iter()
-    .map(|h| Cell::from(h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    .map(|h| {
+        Cell::from(h).style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    });
 
     let header = Row::new(header_cells).height(1);
 
@@ -171,87 +197,219 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
     );
     frame.render_widget(ports_table, chunks[1]);
 
-    // 3. Keybinding & Protocol Control Bar
+    // 3. Keybinding & On-Demand Logging Control Bar
     let (pa, pb) = adjacent_port_pair(ui.selected_port, st.profile.port_count);
     let controls_text = vec![
         Line::from(vec![
-            Span::styled("[1-8/↑↓]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[1-8/↑↓]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(format!(" Select P{}  ", ui.selected_port)),
-            Span::styled("[c]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::raw(" Connect/Disc  "),
-            Span::styled("[b]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[c]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Connect  "),
+            Span::styled(
+                "[b]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" Baud  "),
-            Span::styled("[f]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[f]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" Framing  "),
-            Span::styled("[d]", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-            Span::raw(" DTR  "),
-            Span::styled("[r]", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-            Span::raw(" RTS  "),
-            Span::styled("[x]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw(" Flush FIFO  "),
-            Span::styled("[k]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            Span::raw(" Send BREAK"),
+            Span::styled(
+                "[d/r]",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" DTR/RTS  "),
+            Span::styled(
+                "[x]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Flush  "),
+            Span::styled(
+                "[k]",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" BREAK  "),
+            Span::styled(
+                "[i]",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Inject TX"),
         ]),
         Line::from(vec![
-            Span::styled("[t]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw(format!(" Passive Tap (P{pa}+P{pb})  ")),
-            Span::styled("[v]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(format!(" Active MITM (P{pa}⟷P{pb})  ")),
-            Span::styled("[i]", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-            Span::raw(" Inject TX  "),
-            Span::styled("[p]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::raw(" Auto-Detect Model  "),
-            Span::styled("[u]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::raw(" UDP 4800 Scan  "),
-            Span::styled("[m]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw(" Cycle Demo Model  "),
-            Span::styled("[l]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            Span::raw(" JSONL Rec  "),
-            Span::styled("[q]", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[l]",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Toggle Live Log  "),
+            Span::styled(
+                "[w]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Dump Buffer to Log Now  "),
+            Span::styled(
+                "[n]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Add Log Note  "),
+            Span::styled(
+                "[t]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" Tap(P{pa}+P{pb})  ")),
+            Span::styled(
+                "[v]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" MITM(P{pa}⟷P{pb})  ")),
+            Span::styled(
+                "[a]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Set IP  "),
+            Span::styled(
+                "[p]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Probe  "),
+            Span::styled(
+                "[m]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Model  "),
+            Span::styled(
+                "[q]",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" Quit"),
         ]),
     ];
-    let controls_block = Paragraph::new(controls_text)
-        .block(Block::default().borders(Borders::ALL).title(" Hardware & Protocol Controls "));
+    let controls_block = Paragraph::new(controls_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Hardware, Sniffing & On-Demand Logging Controls "),
+    );
     frame.render_widget(controls_block, chunks[2]);
 
     // 4. Live Framed Packet Inspector with Byte-Diff Highlighting & CRC-16/MODBUS
     render_frame_inspector(frame, chunks[3], &st);
 
-    // 5. Event Log or Modal Injection Input Bar
-    if ui.input_mode {
-        let prompt = Paragraph::new(format!(
-            "Inject on Port {} (ASCII e.g. \\x0201POLL\\x03 or Hex e.g. hex:02 30 31 03): {}█",
-            ui.selected_port, ui.input_buffer
-        ))
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Transmit / Inject Serial Frame (Enter = Send, Esc = Cancel) "),
-        );
-        frame.render_widget(prompt, chunks[4]);
-    } else {
-        let logs: Vec<Line> = st
-            .status_log
-            .iter()
-            .rev()
-            .take(3)
-            .rev()
-            .map(|entry| {
-                let style = if entry.contains("ERROR") || entry.contains("WARNING") {
-                    Style::default().fg(Color::Red)
-                } else if entry.contains("NOTE:") {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                Line::from(Span::styled(entry.clone(), style))
-            })
-            .collect();
-        let log_block = Paragraph::new(logs)
-            .block(Block::default().borders(Borders::ALL).title(" System & Discovery Event Log "));
-        frame.render_widget(log_block, chunks[4]);
+    // 5. Event Log or Modal Input Bar
+    match ui.prompt_kind {
+        PromptKind::InjectFrame => {
+            let prompt = Paragraph::new(format!(
+                "Inject on Port {} (ASCII e.g. \\x0201POLL\\x03 or Hex e.g. hex:02 30 31 03): {}█",
+                ui.selected_port, ui.input_buffer
+            ))
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Transmit / Inject Serial Frame (Enter = Send, Esc = Cancel) "),
+            );
+            frame.render_widget(prompt, chunks[4]);
+        }
+        PromptKind::AnnotateLog => {
+            let prompt = Paragraph::new(format!(
+                "Log Note / Test Action Label (written to active .log & event history): {}█",
+                ui.input_buffer
+            ))
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Add Timestamped Operator Annotation to Log (Enter = Record Note, Esc = Cancel) "),
+            );
+            frame.render_widget(prompt, chunks[4]);
+        }
+        PromptKind::ChangeHostIp => {
+            let prompt = Paragraph::new(format!(
+                "New Moxa NPort IP Address (e.g. 192.168.127.254, 10.0.0.50, or 'demo'): {}█",
+                ui.input_buffer
+            ))
+            .style(
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Connect to New Moxa IP Address & Auto-Detect Model (Enter = Connect, Esc = Cancel) "),
+            );
+            frame.render_widget(prompt, chunks[4]);
+        }
+        PromptKind::None => {
+            let logs: Vec<Line> = st
+                .status_log
+                .iter()
+                .rev()
+                .take(3)
+                .rev()
+                .map(|entry| {
+                    let style = if entry.contains("ERROR") || entry.contains("WARNING") {
+                        Style::default().fg(Color::Red)
+                    } else if entry.contains("OPERATOR NOTE") || entry.contains("Dumped") || entry.contains("Live stream logging ON") {
+                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    } else if entry.contains("NOTE:") {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    Line::from(Span::styled(entry.clone(), style))
+                })
+                .collect();
+            let log_block = Paragraph::new(logs).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" System, Discovery & On-Demand Logging Event Log "),
+            );
+            frame.render_widget(log_block, chunks[4]);
+        }
     }
 }
 
@@ -292,7 +450,6 @@ fn render_frame_inspector(
             Style::default().fg(base_color),
         )];
 
-        // Render up to 15 hex bytes with byte-diff highlighting
         let max_hex_bytes = 15usize;
         for (idx, &b) in fr.payload.iter().take(max_hex_bytes).enumerate() {
             let is_changed = fr.changed_indices.contains(&idx);
@@ -398,6 +555,7 @@ async fn main() -> Result<()> {
     let mut host = String::from("192.168.127.254");
     let mut demo = false;
     let mut snapshot = false;
+    let mut start_log: Option<String> = None;
     let mut gap_ms = 8.0f64;
 
     let mut args = std::env::args().skip(1);
@@ -405,13 +563,18 @@ async fn main() -> Result<()> {
         match arg.as_str() {
             "--demo" => demo = true,
             "--snapshot" => snapshot = true,
+            "--log" => {
+                start_log = Some(String::from("session"));
+            }
             "--gap-ms" => {
                 if let Some(v) = args.next() {
                     gap_ms = v.parse().unwrap_or(8.0);
                 }
             }
             "-h" | "--help" => {
-                println!("Usage: smt-tui [NPORT_IP] [--demo] [--snapshot] [--gap-ms MS]");
+                println!(
+                    "Usage: smt-tui [NPORT_IP] [--demo] [--log] [--snapshot] [--gap-ms MS]"
+                );
                 return Ok(());
             }
             other if !other.starts_with('-') => {
@@ -425,12 +588,19 @@ async fn main() -> Result<()> {
     if !demo {
         ctrl.probe_all_ports().await;
     }
+    if let Some(lbl) = start_log {
+        ctrl.state.lock().unwrap().toggle_jsonl(Some(&lbl));
+    }
 
     if snapshot {
         if demo {
             tokio::time::sleep(Duration::from_millis(2100)).await;
         }
+        let dumped = ctrl.state.lock().unwrap().dump_buffer_on_demand(Some("snapshot"));
         print_snapshot(&ctrl);
+        if let Some(path) = dumped {
+            println!("Saved on-demand stream log dump to: {}", path.display());
+        }
         return Ok(());
     }
 
@@ -467,24 +637,37 @@ async fn run_event_loop(
             continue;
         }
 
-        if ui.input_mode {
+        if ui.prompt_kind != PromptKind::None {
             match key.code {
                 KeyCode::Esc => {
-                    ui.input_mode = false;
+                    ui.prompt_kind = PromptKind::None;
                     ui.input_buffer.clear();
                 }
                 KeyCode::Enter => {
                     let raw = ui.input_buffer.trim().to_string();
-                    ui.input_mode = false;
+                    let mode = std::mem::replace(&mut ui.prompt_kind, PromptKind::None);
                     ui.input_buffer.clear();
                     if !raw.is_empty() {
-                        match parse_payload_input(&raw) {
-                            Ok(bytes) => ctrl.inject_payload(ui.selected_port, bytes).await,
-                            Err(e) => ctrl
-                                .state
-                                .lock()
-                                .unwrap()
-                                .log_event(format!("ERROR parsing payload: {e}")),
+                        match mode {
+                            PromptKind::InjectFrame => match parse_payload_input(&raw) {
+                                Ok(bytes) => ctrl.inject_payload(ui.selected_port, bytes).await,
+                                Err(e) => ctrl
+                                    .state
+                                    .lock()
+                                    .unwrap()
+                                    .log_event(format!("ERROR parsing payload: {e}")),
+                            },
+                            PromptKind::AnnotateLog => {
+                                ctrl.state.lock().unwrap().annotate_log(&raw);
+                            }
+                            PromptKind::ChangeHostIp => {
+                                ctrl.switch_target_host(&raw).await;
+                                let new_max = ctrl.state.lock().unwrap().profile.port_count;
+                                if ui.selected_port > new_max {
+                                    ui.selected_port = new_max;
+                                }
+                            }
+                            PromptKind::None => {}
                         }
                     }
                 }
@@ -562,6 +745,10 @@ async fn run_event_loop(
                 let (pa, pb) = adjacent_port_pair(ui.selected_port, max_ports);
                 ctrl.start_mitm_bridge(pa, pb).await;
             }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                ui.prompt_kind = PromptKind::ChangeHostIp;
+                ui.input_buffer = ctrl.state.lock().unwrap().host.clone();
+            }
             KeyCode::Char('p') | KeyCode::Char('P') => {
                 ctrl.probe_all_ports().await;
             }
@@ -573,7 +760,9 @@ async fn run_event_loop(
                 if let Ok(units) = discover_nports_udp(Duration::from_millis(900)).await {
                     let mut st = ctrl.state.lock().unwrap();
                     if units.is_empty() {
-                        st.log_event("UDP 4800 scan finished: no remote NPort units responded on LAN");
+                        st.log_event(
+                            "UDP 4800 scan finished: no remote NPort units responded on LAN",
+                        );
                     } else {
                         for u in units {
                             st.log_event(format!(
@@ -588,7 +777,6 @@ async fn run_event_loop(
                 }
             }
             KeyCode::Char('m') | KeyCode::Char('M') => {
-                // Cycle simulated Moxa NPort hardware model to demonstrate dynamic UI adaptation
                 ui.demo_model_idx = (ui.demo_model_idx + 1) % DEMO_MODEL_IDS.len();
                 let next_id = DEMO_MODEL_IDS[ui.demo_model_idx];
                 let profile = NPortModelProfile::from_model_id(next_id);
@@ -608,13 +796,20 @@ async fn run_event_loop(
             KeyCode::Char('l') | KeyCode::Char('L') => {
                 ctrl.state.lock().unwrap().toggle_jsonl(None);
             }
+            KeyCode::Char('w') | KeyCode::Char('W') => {
+                ctrl.state.lock().unwrap().dump_buffer_on_demand(None);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                ui.prompt_kind = PromptKind::AnnotateLog;
+                ui.input_buffer.clear();
+            }
             KeyCode::Char('g') | KeyCode::Char('G') => {
                 let mut st = ctrl.state.lock().unwrap();
                 st.frames.clear();
                 st.log_event("Cleared frame inspector display buffer");
             }
             KeyCode::Char('i') | KeyCode::Char('I') => {
-                ui.input_mode = true;
+                ui.prompt_kind = PromptKind::InjectFrame;
                 ui.input_buffer.clear();
             }
             _ => {}

@@ -5,6 +5,7 @@
 __pycache__/
 *.py[cod]
 
-# Recorded serial captures & logs
+# Recorded serial captures & on-demand logs
+/logs/
 *.jsonl
 *.log

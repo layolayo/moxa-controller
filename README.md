@@ -56,10 +56,14 @@ cargo build --release
 | **`t`** | Start **Passive Dual-RX Tap** on the adjacent port pair (`P1+P2`, `P3+P4`, `P5+P6`, `P7+P8`) |
 | **`v`** | Start **Active MITM Bridge** on the adjacent port pair (`P1⟷P2`, `P3⟷P4`, `P5⟷P6`, `P7⟷P8`) |
 | **`i`** | **Inject / Transmit Frame** (enter ASCII e.g. `\x0201POLL\x03` or Hex e.g. `hex:02 30 31 03`) |
+| **`a`** | **Set Moxa IP Address** (enter a new IP e.g. `192.168.1.250` or `demo` to connect and auto-detect the new Moxa model) |
+| **`l`** | **Toggle Live Stream Log** on/off (writes real-time frames to `logs/nport_stream_*.log` and `.jsonl`) |
+| **`w`** | **Dump Buffer to Log Now** (instantly writes up to 500 buffered frames from memory to `logs/nport_dump_*.log` and `.jsonl`) |
+| **`n`** | **Add Operator Note** (injects a timestamped `=== OPERATOR NOTE ===` marker into the active stream log) |
 | **`p`** | Poll target IP to **Auto-Detect Moxa Model** and refresh `CTS`/`DSR`/`DCD` hardware input lines |
 | **`u`** | Broadcast **Moxa UDP 4800 Discovery** to find all NPort units on the LAN |
 | **`m`** | *(In Demo Mode)* Cycle simulated Moxa hardware model (`5610-8-DT` → `5450` → `5250A` → `5110`) to watch the UI adapt |
-| **`l`** / **`g`** / **`q`** | Toggle live `.jsonl` packet recording (`l`), clear frame buffer (`g`), or quit (`q`) |
+| **`g`** / **`q`** | Clear frame buffer (`g`) or quit (`q`) |
 
 ### 3. Run the Background Control Daemon (`smt-daemon`)
 ```bash

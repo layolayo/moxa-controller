@@ -753,6 +753,23 @@ impl SerialFrame {
             })
             .collect()
     }
+
+    pub fn format_log_line(&self) -> String {
+        format!(
+            "#{:<5} [{} +{:>8.2}ms] {:<14} ({:>3}B) | {:<45} | {:<16} | XOR:{:02X} LRC:{:02X} CRC16:{:04X} | Diff:{:?}",
+            self.seq,
+            self.timestamp.format("%Y-%m-%d %H:%M:%S%.3f"),
+            self.delta_ms,
+            self.direction,
+            self.payload.len(),
+            self.hex_string(),
+            self.ascii_string(),
+            self.checksums.xor8,
+            self.checksums.lrc,
+            self.checksums.crc16_modbus,
+            self.changed_indices
+        )
+    }
 }
 
 pub struct SharedEngineState {
@@ -766,7 +783,10 @@ pub struct SharedEngineState {
     pub frames: VecDeque<SerialFrame>,
     pub status_log: VecDeque<String>,
     pub jsonl_path: Option<PathBuf>,
+    pub text_log_path: Option<PathBuf>,
     jsonl_file: Option<std::fs::File>,
+    text_log_file: Option<std::fs::File>,
+    pub frame_tx: tokio::sync::broadcast::Sender<SerialFrame>,
     seq: u64,
     last_instant: Option<Instant>,
     last_payload_by_dir: HashMap<String, Vec<u8>>,
@@ -798,6 +818,8 @@ impl SharedEngineState {
             }
         }
 
+        let (frame_tx, _) = tokio::sync::broadcast::channel(256);
+
         let mut st = Self {
             host: host.clone(),
             profile: profile.clone(),
@@ -817,7 +839,10 @@ impl SharedEngineState {
             frames: VecDeque::with_capacity(500),
             status_log: VecDeque::with_capacity(60),
             jsonl_path: None,
+            text_log_path: None,
             jsonl_file: None,
+            text_log_file: None,
+            frame_tx,
             seq: 0,
             last_instant: None,
             last_payload_by_dir: HashMap::new(),
@@ -861,10 +886,24 @@ impl SharedEngineState {
 
     pub fn log_event(&mut self, msg: impl Into<String>) {
         let ts = Local::now().format("%H:%M:%S");
+        let entry = format!("[{ts}] {}", msg.into());
+        if let Some(ref mut tf) = self.text_log_file {
+            let _ = writeln!(tf, "# EVENT {entry}");
+            let _ = tf.flush();
+        }
         if self.status_log.len() >= 60 {
             self.status_log.pop_front();
         }
-        self.status_log.push_back(format!("[{ts}] {}", msg.into()));
+        self.status_log.push_back(entry);
+    }
+
+    pub fn annotate_log(&mut self, note: &str) {
+        let clean = note.trim();
+        if clean.is_empty() {
+            return;
+        }
+        let banner = format!("=== OPERATOR NOTE: {clean} ===");
+        self.log_event(banner);
     }
 
     pub fn record_frame(&mut self, port_num: u8, direction: impl Into<String>, payload: Vec<u8>) {
@@ -908,12 +947,18 @@ impl SharedEngineState {
             checksums,
         };
 
-        if let Some(ref mut f) = self.jsonl_file {
+        if let Some(ref mut jf) = self.jsonl_file {
             if let Ok(line) = serde_json::to_string(&frame) {
-                let _ = writeln!(f, "{line}");
-                let _ = f.flush();
+                let _ = writeln!(jf, "{line}");
+                let _ = jf.flush();
             }
         }
+        if let Some(ref mut tf) = self.text_log_file {
+            let _ = writeln!(tf, "{}", frame.format_log_line());
+            let _ = tf.flush();
+        }
+
+        let _ = self.frame_tx.send(frame.clone());
 
         if self.frames.len() >= 500 {
             self.frames.pop_front();
@@ -921,32 +966,114 @@ impl SharedEngineState {
         self.frames.push_back(frame);
     }
 
-    pub fn toggle_jsonl(&mut self, custom_path: Option<PathBuf>) -> Option<PathBuf> {
-        if self.jsonl_file.is_some() {
+    /// Start or stop live dual-format (`.log` + `.jsonl`) stream recording on demand.
+    pub fn toggle_jsonl(&mut self, custom_label: Option<&str>) -> Option<PathBuf> {
+        if self.jsonl_file.is_some() || self.text_log_file.is_some() {
             self.jsonl_file = None;
-            let old = self.jsonl_path.take();
-            self.log_event(format!("Stopped JSONL recording ({:?})", old));
+            self.text_log_file = None;
+            let old_log = self.text_log_path.take();
+            let _ = self.jsonl_path.take();
+            self.log_event(format!("Stopped live stream logging ({:?})", old_log));
             return None;
         }
-        let path = custom_path.unwrap_or_else(|| {
-            let stamp = Local::now().format("%Y%m%d_%H%M%S");
-            PathBuf::from(format!("nport_capture_{stamp}.jsonl"))
-        });
-        match OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(file) => {
-                self.jsonl_file = Some(file);
-                self.jsonl_path = Some(path.clone());
+
+        let _ = std::fs::create_dir_all("logs");
+        let stamp = Local::now().format("%Y%m%d_%H%M%S");
+        let tag = custom_label
+            .map(|s| {
+                s.chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+                    .collect::<String>()
+            })
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("_{s}"))
+            .unwrap_or_default();
+
+        let jsonl_path = PathBuf::from(format!("logs/nport_stream{tag}_{stamp}.jsonl"));
+        let log_path = PathBuf::from(format!("logs/nport_stream{tag}_{stamp}.log"));
+
+        match (
+            OpenOptions::new().create(true).append(true).open(&jsonl_path),
+            OpenOptions::new().create(true).append(true).open(&log_path),
+        ) {
+            (Ok(jf), Ok(mut tf)) => {
+                let _ = writeln!(
+                    tf,
+                    "# SMT Control System Live Stream Log — {} ({}) @ {}",
+                    self.profile.model_name, self.host, stamp
+                );
+                let _ = tf.flush();
+                self.jsonl_file = Some(jf);
+                self.text_log_file = Some(tf);
+                self.jsonl_path = Some(jsonl_path);
+                self.text_log_path = Some(log_path.clone());
                 self.log_event(format!(
-                    "Recording structured JSONL capture to {}",
-                    path.display()
+                    "Live stream logging ON -> {} (+ .jsonl)",
+                    log_path.display()
                 ));
-                Some(path)
+                Some(log_path)
             }
-            Err(err) => {
-                self.log_event(format!("ERROR opening JSONL file: {err}"));
+            (Err(e), _) | (_, Err(e)) => {
+                self.log_event(format!("ERROR opening stream log files: {e}"));
                 None
             }
         }
+    }
+
+    /// Immediately dump all buffered frames in memory (up to 500 frames) to a `.log` and `.jsonl` file on demand.
+    pub fn dump_buffer_on_demand(&mut self, custom_label: Option<&str>) -> Option<PathBuf> {
+        let _ = std::fs::create_dir_all("logs");
+        let stamp = Local::now().format("%Y%m%d_%H%M%S");
+        let tag = custom_label
+            .map(|s| {
+                s.chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+                    .collect::<String>()
+            })
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("_{s}"))
+            .unwrap_or_default();
+
+        let log_path = PathBuf::from(format!("logs/nport_dump{tag}_{stamp}.log"));
+        let jsonl_path = PathBuf::from(format!("logs/nport_dump{tag}_{stamp}.jsonl"));
+
+        let mut tf = match OpenOptions::new().create(true).write(true).truncate(true).open(&log_path) {
+            Ok(f) => f,
+            Err(e) => {
+                self.log_event(format!("ERROR creating on-demand dump file: {e}"));
+                return None;
+            }
+        };
+        let mut jf = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&jsonl_path)
+            .ok();
+
+        let _ = writeln!(
+            tf,
+            "# SMT Control System On-Demand Buffer Dump — {} ({}-Port {}) @ {}",
+            self.profile.model_name, self.profile.port_count, self.profile.interfaces, self.host
+        );
+        let _ = writeln!(tf, "# Captured Frames: {}", self.frames.len());
+        let _ = writeln!(tf, "{}", "-".repeat(120));
+
+        for fr in &self.frames {
+            let _ = writeln!(tf, "{}", fr.format_log_line());
+            if let Some(ref mut jfile) = jf {
+                if let Ok(js) = serde_json::to_string(fr) {
+                    let _ = writeln!(jfile, "{js}");
+                }
+            }
+        }
+        let _ = tf.flush();
+        let count = self.frames.len();
+        self.log_event(format!(
+            "Dumped {count} buffered frames on demand -> {} (+ .jsonl)",
+            log_path.display()
+        ));
+        Some(log_path)
     }
 }
 
@@ -1464,6 +1591,36 @@ impl NPortController {
             }
             st.record_frame(port_num, format!("P{port_num} RX←DEV"), reply);
         }
+    }
+
+    /// Switch the controller to a new Moxa NPort IP address at runtime, disconnect old streams,
+    /// and automatically probe the new device's model, port count, and hardware line status.
+    pub async fn switch_target_host(&self, new_host: impl Into<String>) {
+        let cleaned = new_host.into().trim().to_string();
+        if cleaned.is_empty() {
+            return;
+        }
+        let max_p = { self.state.lock().unwrap().ports.len() as u8 };
+        for p in 1..=max_p {
+            self.disconnect_port(p);
+        }
+
+        let is_demo = cleaned.eq_ignore_ascii_case("demo") || cleaned.eq_ignore_ascii_case("sim");
+        {
+            let mut st = self.state.lock().unwrap();
+            if is_demo {
+                let h = st.host.clone();
+                st.simulate = true;
+                st.mode_banner = String::from("DEMO SIMULATION");
+                st.log_event(format!("Switched target to Simulation Mode ({h})"));
+            } else {
+                st.host = cleaned.clone();
+                st.simulate = false;
+                st.mode_banner = String::from("PROBED");
+                st.log_event(format!("Switching target Moxa IP address to {cleaned} ..."));
+            }
+        }
+        self.probe_all_ports().await;
     }
 }
 
