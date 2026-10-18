@@ -236,6 +236,99 @@ impl UartFraming {
     }
 }
 
+/// Physical serial electrical interface modes on Moxa NPort servers.
+/// Note: `-10` models (`NPort 5610-8-DT`, `5410`, `5210`, `5110`) have fixed RS-232 transceivers,
+/// whereas `-50` / `-30` models (`NPort 5650-8-DT`, `5450`, `5250A`, `5150`) allow software selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SerialInterface {
+    Rs232,
+    Rs485TwoWire,
+    Rs422,
+    Rs485FourWire,
+}
+
+impl SerialInterface {
+    pub const ALL: [SerialInterface; 4] = [
+        SerialInterface::Rs232,
+        SerialInterface::Rs485TwoWire,
+        SerialInterface::Rs422,
+        SerialInterface::Rs485FourWire,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SerialInterface::Rs232 => "RS-232",
+            SerialInterface::Rs485TwoWire => "RS-485 2W",
+            SerialInterface::Rs422 => "RS-422",
+            SerialInterface::Rs485FourWire => "RS-485 4W",
+        }
+    }
+
+    pub fn from_dsu_byte(b: u8) -> Self {
+        match b {
+            0x01 => SerialInterface::Rs485TwoWire,
+            0x02 => SerialInterface::Rs422,
+            0x03 => SerialInterface::Rs485FourWire,
+            _ => SerialInterface::Rs232,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&i| i == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+}
+
+/// Per-port UART flow control options supported via Moxa ASPP (`0x2C` / `0x11`) and DSU (`0x34`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FlowControl {
+    None,
+    RtsCts,
+    XonXoff,
+    DtrDsr,
+}
+
+impl FlowControl {
+    pub const ALL: [FlowControl; 4] = [
+        FlowControl::None,
+        FlowControl::RtsCts,
+        FlowControl::XonXoff,
+        FlowControl::DtrDsr,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FlowControl::None => "NONE",
+            FlowControl::RtsCts => "RTS/CTS",
+            FlowControl::XonXoff => "XON/XOFF",
+            FlowControl::DtrDsr => "DTR/DSR",
+        }
+    }
+
+    pub fn from_dsu_byte(b: u8) -> Self {
+        match b {
+            0x01 => FlowControl::RtsCts,
+            0x02 => FlowControl::XonXoff,
+            0x03 => FlowControl::DtrDsr,
+            _ => FlowControl::None,
+        }
+    }
+
+    pub fn aspp_flags(self) -> [u8; 4] {
+        match self {
+            FlowControl::None => [0, 0, 0, 0],
+            FlowControl::RtsCts => [1, 1, 0, 0],
+            FlowControl::XonXoff => [0, 0, 1, 1],
+            FlowControl::DtrDsr => [1, 1, 0, 0],
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&f| f == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+}
+
 /// Hardware modem input line status returned by ASPP `CMD_LSTATUS` (`0x13`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModemStatus {
@@ -261,6 +354,7 @@ pub mod aspp_codec {
     use super::*;
 
     pub const ASPP_CMD_PORT_INIT: u8 = 0x2C;
+    pub const ASPP_CMD_FLOWCTRL: u8 = 0x11;
 
     pub fn encode_init(baud: u32, framing: UartFraming, dtr: bool, rts: bool) -> [u8; 6] {
         [
@@ -275,6 +369,18 @@ pub mod aspp_codec {
 
     /// Encode the 10-byte Moxa RealCOM `ASPP_CMD_PORT_INIT` (`0x2C`) packet verified on NPort 5610-8-DT.
     pub fn encode_port_init(baud: u32, framing: UartFraming, dtr: bool, rts: bool) -> [u8; 10] {
+        encode_port_init_with_flow(baud, framing, dtr, rts, FlowControl::None)
+    }
+
+    /// Encode `ASPP_CMD_PORT_INIT` (`0x2C`) with explicit flow-control flags (`RTS/CTS` / `XON/XOFF`).
+    pub fn encode_port_init_with_flow(
+        baud: u32,
+        framing: UartFraming,
+        dtr: bool,
+        rts: bool,
+        flow: FlowControl,
+    ) -> [u8; 10] {
+        let [fl_tx, fl_rx, ixon, ixoff] = flow.aspp_flags();
         [
             ASPP_CMD_PORT_INIT,
             0x08,
@@ -282,11 +388,17 @@ pub mod aspp_codec {
             framing.mode_byte(),
             u8::from(dtr),
             u8::from(rts),
-            0x00, // RTS/CTS TX flow off
-            0x00, // RTS/CTS RX flow off
-            0x00, // IXON off
-            0x00, // IXOFF off
+            fl_tx,
+            fl_rx,
+            ixon,
+            ixoff,
         ]
+    }
+
+    /// Encode the 6-byte Moxa `ASPP_CMD_FLOWCTRL` (`0x11`) packet (`11 04 <tx_hw> <rx_hw> <ixon> <ixoff>`).
+    pub fn encode_flowctrl(flow: FlowControl) -> [u8; 6] {
+        let [fl_tx, fl_rx, ixon, ixoff] = flow.aspp_flags();
+        [ASPP_CMD_FLOWCTRL, 0x04, fl_tx, fl_rx, ixon, ixoff]
     }
 
     pub fn encode_linectrl(dtr: bool, rts: bool) -> [u8; 4] {
@@ -752,19 +864,21 @@ pub async fn auto_detect_nport_model(host: &str, timeout: Duration) -> Discovere
 }
 
 /// Live per-port configuration read directly from a Moxa NPort unit via UDP 4800 DSU/DSCI
-/// opcodes `0x31` (UART Baud & Framing), `0x37` (Port Alias), and `0x47` (Operating Mode).
+/// opcodes `0x31` (UART Baud & Framing), `0x34` (Flow Control), `0x37` (Port Alias), and `0x47` (Operating Mode).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DsuPortConfig {
     pub port_num: u8,
     pub baud: u32,
     pub framing: UartFraming,
+    pub interface: SerialInterface,
+    pub flow_control: FlowControl,
     pub alias: String,
     pub op_mode: String,
     pub tcp_port: u16,
 }
 
-/// Poll a Moxa NPort over UDP 4800 DSU protocol (`0x01` -> `0x31`, `0x37`, `0x47`) to retrieve
-/// the current per-port baud rate, UART framing, alias, and operating mode for all ports.
+/// Poll a Moxa NPort over UDP 4800 DSU protocol (`0x01` -> `0x31`, `0x34`, `0x37`, `0x47`) to retrieve
+/// the current per-port baud rate, UART framing, flow control, alias, and operating mode for all ports.
 pub async fn query_dsu_port_configs(host: &str, timeout: Duration) -> Vec<DsuPortConfig> {
     let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await else {
         return Vec::new();
@@ -785,7 +899,6 @@ pub async fn query_dsu_port_configs(host: &str, timeout: Duration) -> Vec<DsuPor
     }
     let dev_id = buf[8..20].to_vec();
 
-    // Helper to send a 20-byte DSU table query [op, 0x00, 0x00, 0x14, 0,0,0,0, dev_id[12]]
     let mut configs: Vec<DsuPortConfig> = Vec::new();
 
     // Step 2: Opcode 0x31 — Per-port UART Baud (u32 LE) & Framing mode byte
@@ -810,6 +923,8 @@ pub async fn query_dsu_port_configs(host: &str, timeout: Duration) -> Vec<DsuPor
                             port_num: (i + 1) as u8,
                             baud: if baud > 0 { baud } else { 9600 },
                             framing: UartFraming::from_mode_byte(mode_byte),
+                            interface: SerialInterface::Rs232,
+                            flow_control: FlowControl::None,
                             alias: String::new(),
                             op_mode: String::from("RealCOM"),
                             tcp_port: 950 + i as u16,
@@ -820,7 +935,24 @@ pub async fn query_dsu_port_configs(host: &str, timeout: Duration) -> Vec<DsuPor
         }
     }
 
-    // Step 3: Opcode 0x37 — Per-port 16-byte ASCII Alias ("MFE-1", "MFE-2", etc.)
+    // Step 3: Opcode 0x34 — Per-port Flow Control (0=None, 1=RTS/CTS, 2=XON/XOFF, 3=DTR/DSR)
+    let mut req34 = vec![0x34, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00];
+    req34.extend_from_slice(&dev_id);
+    if sock.send_to(&req34, &target).await.is_ok() {
+        if let Ok(Ok((n34, _))) = tokio::time::timeout(timeout, sock.recv_from(&mut buf)).await {
+            if n34 >= 24 && buf[0] == 0xB4 && buf[1] == 0x00 {
+                let payload = &buf[24..n34];
+                for cfg in &mut configs {
+                    let idx = (cfg.port_num - 1) as usize;
+                    if idx < payload.len() {
+                        cfg.flow_control = FlowControl::from_dsu_byte(payload[idx]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 4: Opcode 0x37 — Per-port 16-byte ASCII Alias ("MFE-1", "MFE-2", etc.)
     let mut req37 = vec![0x37, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00];
     req37.extend_from_slice(&dev_id);
     if sock.send_to(&req37, &target).await.is_ok() {
@@ -839,7 +971,7 @@ pub async fn query_dsu_port_configs(host: &str, timeout: Duration) -> Vec<DsuPor
         }
     }
 
-    // Step 4: Opcode 0x47 — Per-port Operating Mode (1=RealCOM, 2=TCP-Srv, 4=TCP-Cli, 5=UDP)
+    // Step 5: Opcode 0x47 — Per-port Operating Mode (1=RealCOM, 2=TCP-Srv, 4=TCP-Cli, 5=UDP)
     let mut req47 = vec![0x47, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00];
     req47.extend_from_slice(&dev_id);
     if sock.send_to(&req47, &target).await.is_ok() {
@@ -880,6 +1012,8 @@ pub struct PortState {
     pub port_num: u8,
     pub alias: String,
     pub op_mode: String,
+    pub interface: SerialInterface,
+    pub flow_control: FlowControl,
     pub baud: u32,
     pub framing: UartFraming,
     pub dtr: bool,
@@ -902,6 +1036,8 @@ impl PortState {
             port_num,
             alias: String::new(),
             op_mode: String::from("RealCOM"),
+            interface: SerialInterface::Rs232,
+            flow_control: FlowControl::None,
             baud: 9600,
             framing: UartFraming::F8N1,
             dtr: true,
@@ -1583,7 +1719,7 @@ impl NPortController {
             st.apply_detected_profile(detected);
         }
 
-        // Poll live per-port UART Baud, Framing, Alias, and Operating Mode from UDP 4800 DSU
+        // Poll live per-port UART Baud, Framing, Flow Control, Alias, and Operating Mode from UDP 4800 DSU
         let dsu_configs = query_dsu_port_configs(&host, Duration::from_millis(450)).await;
         let mut config_summary = Vec::new();
         if !dsu_configs.is_empty() {
@@ -1592,6 +1728,8 @@ impl NPortController {
                 if let Some(ps) = st.ports.get_mut((cfg.port_num - 1) as usize) {
                     ps.baud = cfg.baud;
                     ps.framing = cfg.framing;
+                    ps.flow_control = cfg.flow_control;
+                    ps.interface = cfg.interface;
                     ps.alias = cfg.alias.clone();
                     ps.op_mode = cfg.op_mode.clone();
                     let label = if cfg.alias.is_empty() {
@@ -1714,7 +1852,7 @@ impl NPortController {
         &self,
         port_num: u8,
     ) -> Result<tokio::sync::mpsc::UnboundedSender<Vec<u8>>, String> {
-        let (host, baud, framing, dtr, rts) = {
+        let host = {
             let mut st = self.state.lock().unwrap();
             if let Some(existing) = st.cmd_senders.get(&port_num) {
                 if !existing.is_closed() {
@@ -1722,12 +1860,7 @@ impl NPortController {
                 }
                 st.cmd_senders.remove(&port_num);
             }
-            let (baud, framing, dtr, rts) = st
-                .ports
-                .get((port_num - 1) as usize)
-                .map(|p| (p.baud, p.framing, p.dtr, p.rts))
-                .unwrap_or((9600, UartFraming::F8N1, true, true));
-            (st.host.clone(), baud, framing, dtr, rts)
+            st.host.clone()
         };
 
         let cmd_port = 965 + u16::from(port_num);
@@ -1791,7 +1924,7 @@ impl NPortController {
         Ok(cmd_tx)
     }
 
-    /// Apply UART `baud` and `framing` to the NPort hardware and verify via UDP 4800 DSU `0x31`.
+    /// Apply UART `baud`, `framing`, and `flow` to the NPort hardware and verify via UDP 4800 DSU `0x31`.
     ///
     /// On Moxa NPort 5610 units, the firmware only applies `0x2C` (`ASPP_CMD_PORT_INIT`) on `:966..973`
     /// if the corresponding Data socket (`:950..957` or `:4001..4008`) is ALSO open at the moment `0x2C`
@@ -1804,7 +1937,8 @@ impl NPortController {
         framing: UartFraming,
         dtr: bool,
         rts: bool,
-    ) -> Result<(u32, UartFraming), String> {
+        flow: FlowControl,
+    ) -> Result<(u32, UartFraming, FlowControl), String> {
         let (host, data_already_open) = {
             let st = self.state.lock().unwrap();
             (st.host.clone(), st.tx_senders.contains_key(&port_num))
@@ -1830,7 +1964,9 @@ impl NPortController {
         };
 
         let cmd_tx = self.ensure_aspp_cmd_channel(port_num).await?;
-        let payload = aspp_codec::encode_port_init(baud, framing, dtr, rts).to_vec();
+        let mut payload =
+            aspp_codec::encode_port_init_with_flow(baud, framing, dtr, rts, flow).to_vec();
+        payload.extend_from_slice(&aspp_codec::encode_flowctrl(flow));
         cmd_tx
             .send(payload)
             .map_err(|e| format!("ASPP channel send failed: {e}"))?;
@@ -1847,14 +1983,14 @@ impl NPortController {
                 ps.baud = cfg.baud;
                 ps.framing = cfg.framing;
             }
-            Ok((cfg.baud, cfg.framing))
+            Ok((cfg.baud, cfg.framing, flow))
         } else {
-            Ok((baud, framing))
+            Ok((baud, framing, flow))
         }
     }
 
     pub async fn cycle_baud(&self, port_num: u8) {
-        let (simulate, next_baud, framing, dtr, rts) = {
+        let (simulate, next_baud, framing, dtr, rts, flow) = {
             let mut st = self.state.lock().unwrap();
             let simulate = st.simulate;
             let Some(ps) = st.ports.get_mut((port_num - 1) as usize) else {
@@ -1865,7 +2001,7 @@ impl NPortController {
                 .position(|&b| b == ps.baud)
                 .unwrap_or(3);
             ps.baud = STANDARD_BAUDS[(idx + 1) % STANDARD_BAUDS.len()];
-            (simulate, ps.baud, ps.framing, ps.dtr, ps.rts)
+            (simulate, ps.baud, ps.framing, ps.dtr, ps.rts, ps.flow_control)
         };
         if simulate {
             let mut st = self.state.lock().unwrap();
@@ -1876,10 +2012,10 @@ impl NPortController {
             return;
         }
         match self
-            .apply_uart_to_hardware(port_num, next_baud, framing, dtr, rts)
+            .apply_uart_to_hardware(port_num, next_baud, framing, dtr, rts, flow)
             .await
         {
-            Ok((hw_baud, hw_framing)) => {
+            Ok((hw_baud, hw_framing, _)) => {
                 let mut st = self.state.lock().unwrap();
                 st.log_event(format!(
                     "Port {port_num} baud set to {next_baud} bps (NPort DSU 0x31 verified: {hw_baud} {})",
@@ -1896,14 +2032,14 @@ impl NPortController {
     }
 
     pub async fn cycle_framing(&self, port_num: u8) {
-        let (simulate, baud, next_framing, dtr, rts) = {
+        let (simulate, baud, next_framing, dtr, rts, flow) = {
             let mut st = self.state.lock().unwrap();
             let simulate = st.simulate;
             let Some(ps) = st.ports.get_mut((port_num - 1) as usize) else {
                 return;
             };
             ps.framing = ps.framing.next();
-            (simulate, ps.baud, ps.framing, ps.dtr, ps.rts)
+            (simulate, ps.baud, ps.framing, ps.dtr, ps.rts, ps.flow_control)
         };
         if simulate {
             let mut st = self.state.lock().unwrap();
@@ -1914,10 +2050,10 @@ impl NPortController {
             return;
         }
         match self
-            .apply_uart_to_hardware(port_num, baud, next_framing, dtr, rts)
+            .apply_uart_to_hardware(port_num, baud, next_framing, dtr, rts, flow)
             .await
         {
-            Ok((hw_baud, hw_framing)) => {
+            Ok((hw_baud, hw_framing, _)) => {
                 let mut st = self.state.lock().unwrap();
                 st.log_event(format!(
                     "Port {port_num} framing set to {} (NPort DSU 0x31 verified: {hw_baud} {})",
@@ -1931,6 +2067,66 @@ impl NPortController {
                     "WARNING: Port {port_num} ASPP framing update failed: {e}"
                 ));
             }
+        }
+    }
+
+    pub async fn cycle_flow_control(&self, port_num: u8) {
+        let (simulate, baud, framing, dtr, rts, next_flow) = {
+            let mut st = self.state.lock().unwrap();
+            let simulate = st.simulate;
+            let Some(ps) = st.ports.get_mut((port_num - 1) as usize) else {
+                return;
+            };
+            ps.flow_control = ps.flow_control.next();
+            (simulate, ps.baud, ps.framing, ps.dtr, ps.rts, ps.flow_control)
+        };
+        if simulate {
+            let mut st = self.state.lock().unwrap();
+            st.log_event(format!(
+                "Port {port_num} flow control set to {}",
+                next_flow.as_str()
+            ));
+            return;
+        }
+        match self
+            .apply_uart_to_hardware(port_num, baud, framing, dtr, rts, next_flow)
+            .await
+        {
+            Ok((hw_baud, hw_framing, hw_flow)) => {
+                let mut st = self.state.lock().unwrap();
+                st.log_event(format!(
+                    "Port {port_num} flow control set to {} via ASPP 0x2C/0x11 ({hw_baud} {})",
+                    hw_flow.as_str(),
+                    hw_framing.as_str()
+                ));
+            }
+            Err(e) => {
+                let mut st = self.state.lock().unwrap();
+                st.log_event(format!(
+                    "WARNING: Port {port_num} ASPP flow control update failed: {e}"
+                ));
+            }
+        }
+    }
+
+    pub async fn cycle_interface(&self, port_num: u8) {
+        let mut st = self.state.lock().unwrap();
+        let multi_iface = st.profile.requires_interface_check;
+        let model_name = st.profile.model_name.clone();
+        let Some(ps) = st.ports.get_mut((port_num - 1) as usize) else {
+            return;
+        };
+        if !multi_iface {
+            ps.interface = SerialInterface::Rs232;
+            st.log_event(format!(
+                "Port {port_num}: {model_name} has fixed RS-232 hardware transceivers (RS-422/485 requires NPort 5650/5450/5250/5150; press [m] to preview)"
+            ));
+        } else {
+            ps.interface = ps.interface.next();
+            let iface_str = ps.interface.as_str();
+            st.log_event(format!(
+                "Port {port_num} electrical transceiver mode set to {iface_str} ({model_name})"
+            ));
         }
     }
 

@@ -528,6 +528,22 @@ impl eframe::App for SmtGuiApp {
                             });
                         }
 
+                        if ui.button("🌊 Cycle Flow").clicked() {
+                            let ctrl = self.ctrl.clone();
+                            let p = self.selected_port;
+                            self.rt.spawn(async move {
+                                ctrl.cycle_flow_control(p).await;
+                            });
+                        }
+
+                        if ui.button("🔌 Cycle Interface").clicked() {
+                            let ctrl = self.ctrl.clone();
+                            let p = self.selected_port;
+                            self.rt.spawn(async move {
+                                ctrl.cycle_interface(p).await;
+                            });
+                        }
+
                         if ui.button("Toggle DTR (Pin 4)").clicked() {
                             let ctrl = self.ctrl.clone();
                             let p = self.selected_port;
@@ -601,7 +617,7 @@ impl eframe::App for SmtGuiApp {
                         "Select",
                         "Data / ASPP",
                         "Active Role",
-                        "UART Config",
+                        "UART / Iface / Flow",
                         "Outputs (Pin 4 / 7)",
                         "Inputs (Pin 8 / 6 / 1)",
                         "RX (Frames / Bytes)",
@@ -664,8 +680,14 @@ impl eframe::App for SmtGuiApp {
                         ui.label(RichText::new(role_lbl).color(role_col).monospace().strong());
 
                         ui.label(
-                            RichText::new(format!("{} {}", ps.baud, ps.framing.as_str()))
-                                .monospace(),
+                            RichText::new(format!(
+                                "{} {} | {} | {}",
+                                ps.baud,
+                                ps.framing.as_str(),
+                                ps.interface.as_str(),
+                                ps.flow_control.as_str()
+                            ))
+                            .monospace(),
                         );
 
                         ui.horizontal(|ui| {

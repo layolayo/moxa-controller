@@ -135,7 +135,7 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
         "DATA",
         "ASPP",
         "ROLE",
-        "UART",
+        "UART / IFACE / FLOW",
         "OUT (DTR/RTS)",
         "IN (CTS/DSR/DCD)",
         "RX (Frames/Bytes)",
@@ -182,7 +182,13 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
             Cell::from(format!(":{}", ps.data_tcp_port())),
             Cell::from(format!(":{}", ps.aspp_tcp_port())),
             Cell::from(role_label),
-            Cell::from(format!("{:>6} {}", ps.baud, ps.framing.as_str())),
+            Cell::from(format!(
+                "{:>6} {} {} {}",
+                ps.baud,
+                ps.framing.as_str(),
+                ps.interface.as_str(),
+                ps.flow_control.as_str()
+            )),
             Cell::from(format!(
                 "DTR:{} RTS:{}",
                 u8::from(ps.dtr),
@@ -202,14 +208,14 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
 
     let widths = [
         Constraint::Length(12),
-        Constraint::Length(7),
-        Constraint::Length(7),
-        Constraint::Length(18),
-        Constraint::Length(12),
-        Constraint::Length(15),
-        Constraint::Length(18),
-        Constraint::Length(18),
-        Constraint::Length(18),
+        Constraint::Length(6),
+        Constraint::Length(6),
+        Constraint::Length(16),
+        Constraint::Length(27),
+        Constraint::Length(13),
+        Constraint::Length(17),
+        Constraint::Length(16),
+        Constraint::Length(16),
     ];
 
     let ports_table = Table::new(rows, widths).header(header).block(
@@ -246,19 +252,19 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Pause/Resume  "),
+            Span::raw(" Pause  "),
             Span::styled(
                 "[s]",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" Stop All  "),
             Span::styled(
-                "[b/f]",
+                "[b/f/j/e]",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Baud/Frame  "),
+            Span::raw(" Baud/Frame/Flow/Iface  "),
             Span::styled(
                 "[d/r]",
                 Style::default()
@@ -586,9 +592,9 @@ fn print_snapshot(ctrl: &NPortController) {
         st.discovery_method
     );
     println!(
-        "PORT         DATA    ASPP   ROLE              UART        OUT(DTR/RTS)  IN(CTS/DSR/DCD)   RX(F/B)      TX(F/B)"
+        "PORT         DATA    ASPP   ROLE              UART / IFACE / FLOW         OUT(DTR/RTS)  IN(CTS/DSR/DCD)   RX(F/B)      TX(F/B)"
     );
-    println!("{}", "-".repeat(113));
+    println!("{}", "-".repeat(128));
     for ps in &st.ports {
         let port_lbl = if ps.alias.is_empty() {
             format!("P{}", ps.port_num)
@@ -601,13 +607,15 @@ fn print_snapshot(ctrl: &NPortController) {
             ps.role.clone()
         };
         println!(
-            "{:<11}  :{:<5} :{:<4}  {:<16}  {:>6} {}  DTR:{} RTS:{}   CTS:{} DSR:{} DCD:{}    {:>3}/{:>5}B   {:>3}/{:>5}B",
+            "{:<11}  :{:<5} :{:<4}  {:<16}  {:>6} {} {:<9} {:<7} DTR:{} RTS:{}   CTS:{} DSR:{} DCD:{}    {:>3}/{:>5}B   {:>3}/{:>5}B",
             port_lbl,
             ps.data_tcp_port(),
             ps.aspp_tcp_port(),
             role_lbl,
             ps.baud,
             ps.framing.as_str(),
+            ps.interface.as_str(),
+            ps.flow_control.as_str(),
             u8::from(ps.dtr),
             u8::from(ps.rts),
             u8::from(ps.modem.cts),
@@ -619,7 +627,7 @@ fn print_snapshot(ctrl: &NPortController) {
             ps.tx_bytes
         );
     }
-    println!("{}", "-".repeat(113));
+    println!("{}", "-".repeat(128));
     for fr in st.frames.iter().rev().take(6).rev() {
         println!(
             "#{:<3} [{} +{:>6.2}ms] {:<14} ({:>2}B) | {:<42} | {:<16} | XOR:{:02X} LRC:{:02X} CRC16:{:04X} | Diff:{:?}",
@@ -859,6 +867,12 @@ async fn run_event_loop(
             }
             KeyCode::Char('f') | KeyCode::Char('F') => {
                 ctrl.cycle_framing(ui.selected_port).await;
+            }
+            KeyCode::Char('j') | KeyCode::Char('J') => {
+                ctrl.cycle_flow_control(ui.selected_port).await;
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                ctrl.cycle_interface(ui.selected_port).await;
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 ctrl.toggle_dtr(ui.selected_port).await;
