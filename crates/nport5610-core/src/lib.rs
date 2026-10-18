@@ -1784,18 +1784,9 @@ impl NPortController {
             .map(|r| r.is_ok())
             .unwrap_or(false);
 
-            let realcom_ok = if !tcpsrv_ok {
-                tokio::time::timeout(
-                    Duration::from_millis(200),
-                    TcpStream::connect(format!("{host}:{realcom_port}")),
-                )
-                .await
-                .map(|r| r.is_ok())
-                .unwrap_or(false)
-            } else {
-                false
-            };
-
+            // Connect to the ASPP Command port (:966..973) rather than opening & closing a bare
+            // RealCOM Data socket (:950..957), because on NPort 5610 firmware a bare connect/close
+            // on :950..957 without 0x2C resets the port's runtime UART baud rate back to NVRAM default.
             let cmd_ok = tokio::time::timeout(
                 Duration::from_millis(200),
                 TcpStream::connect(format!("{host}:{cmd_port}")),
@@ -1803,6 +1794,8 @@ impl NPortController {
             .await
             .map(|r| r.is_ok())
             .unwrap_or(false);
+
+            let realcom_ok = !tcpsrv_ok && cmd_ok;
 
             let data_ok = tcpsrv_ok || realcom_ok;
             let active_data_port = if tcpsrv_ok {
@@ -1926,10 +1919,12 @@ impl NPortController {
 
     /// Apply UART `baud`, `framing`, and `flow` to the NPort hardware and verify via UDP 4800 DSU `0x31`.
     ///
-    /// On Moxa NPort 5610 units, the firmware only applies `0x2C` (`ASPP_CMD_PORT_INIT`) on `:966..973`
-    /// if the corresponding Data socket (`:950..957` or `:4001..4008`) is ALSO open at the moment `0x2C`
-    /// arrives. If the port is not currently streaming, we open a brief Data socket guard while sending
-    /// `0x2C` so the NPort 5610 hardware immediately updates its UART registers.
+    /// On Moxa NPort 5610 units:
+    /// 1. The firmware only applies `0x2C` (`ASPP_CMD_PORT_INIT`) on `:966..973` if the corresponding
+    ///    Data socket (`:950..957` or `:4001..4008`) is opened FIRST, followed by `:966..973`.
+    /// 2. Closing the Data socket causes the NPort 5610 to reset `:966..973`, so when the port is idle
+    ///    (`!data_already_open`), we perform a self-contained `(data_stream, cmd_stream)` transaction,
+    ///    await the synchronous `2C 03 ...` ACK, and close both sockets cleanly.
     async fn apply_uart_to_hardware(
         &self,
         port_num: u8,
@@ -1940,40 +1935,73 @@ impl NPortController {
         flow: FlowControl,
     ) -> Result<(u32, UartFraming, FlowControl), String> {
         let (host, data_already_open) = {
-            let st = self.state.lock().unwrap();
-            (st.host.clone(), st.tx_senders.contains_key(&port_num))
+            let mut st = self.state.lock().unwrap();
+            let active = st.tx_senders.contains_key(&port_num);
+            if !active {
+                // Remove any stale command channel from a previous idle transaction
+                st.cmd_senders.remove(&port_num);
+            }
+            (st.host.clone(), active)
         };
 
-        let _data_guard = if !data_already_open {
+        let mut payload =
+            aspp_codec::encode_port_init_with_flow(baud, framing, dtr, rts, flow).to_vec();
+        payload.extend_from_slice(&aspp_codec::encode_flowctrl(flow));
+
+        if data_already_open {
+            let cmd_tx = self.ensure_aspp_cmd_channel(port_num).await?;
+            cmd_tx
+                .send(payload)
+                .map_err(|e| format!("ASPP channel send failed: {e}"))?;
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        } else {
             let realcom_addr = format!("{host}:{}", 949 + u16::from(port_num));
             let tcpsrv_addr = format!("{host}:{}", 4000 + u16::from(port_num));
-            match tokio::time::timeout(Duration::from_millis(250), TcpStream::connect(&realcom_addr))
-                .await
+            let data_stream = match tokio::time::timeout(
+                Duration::from_millis(300),
+                TcpStream::connect(&realcom_addr),
+            )
+            .await
             {
                 Ok(Ok(s)) => Some(s),
                 _ => tokio::time::timeout(
-                    Duration::from_millis(250),
+                    Duration::from_millis(300),
                     TcpStream::connect(&tcpsrv_addr),
                 )
                 .await
                 .ok()
                 .and_then(|r| r.ok()),
+            };
+
+            let cmd_addr = format!("{host}:{}", 965 + u16::from(port_num));
+            let mut cmd_stream =
+                tokio::time::timeout(Duration::from_millis(400), TcpStream::connect(&cmd_addr))
+                    .await
+                    .map_err(|_| format!("timeout connecting to ASPP {cmd_addr}"))?
+                    .map_err(|e| format!("ASPP {cmd_addr}: {e}"))?;
+            let _ = cmd_stream.set_nodelay(true);
+            cmd_stream
+                .write_all(&payload)
+                .await
+                .map_err(|e| format!("ASPP write failed: {e}"))?;
+            let _ = cmd_stream.flush().await;
+
+            let mut ack_buf = [0u8; 64];
+            if let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_millis(300), cmd_stream.read(&mut ack_buf))
+                    .await
+            {
+                if n >= 3 && ack_buf[0] == aspp_codec::ASPP_CMD_PORT_INIT {
+                    let mut st = self.state.lock().unwrap();
+                    if let Some(ps) = st.ports.get_mut((port_num - 1) as usize) {
+                        ps.modem = ModemStatus::from_aspp_byte(ack_buf[2]);
+                        ps.aspp_cmd_open = true;
+                    }
+                }
             }
-        } else {
-            None
-        };
-
-        let cmd_tx = self.ensure_aspp_cmd_channel(port_num).await?;
-        let mut payload =
-            aspp_codec::encode_port_init_with_flow(baud, framing, dtr, rts, flow).to_vec();
-        payload.extend_from_slice(&aspp_codec::encode_flowctrl(flow));
-        cmd_tx
-            .send(payload)
-            .map_err(|e| format!("ASPP channel send failed: {e}"))?;
-
-        // Give NPort 5610 firmware 60 ms to apply 0x2C while Data + Command sockets are both open
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        drop(_data_guard);
+            drop(cmd_stream);
+            drop(data_stream);
+        }
 
         // Read back live hardware configuration via UDP 4800 DSU opcode 0x31 to verify
         let dsu = query_dsu_port_configs(&host, Duration::from_millis(250)).await;
@@ -1990,7 +2018,7 @@ impl NPortController {
     }
 
     pub async fn cycle_baud(&self, port_num: u8) {
-        let (simulate, next_baud, framing, dtr, rts, flow) = {
+        let (simulate, next_baud, framing, dtr, rts, flow, op_mode, alias) = {
             let mut st = self.state.lock().unwrap();
             let simulate = st.simulate;
             let Some(ps) = st.ports.get_mut((port_num - 1) as usize) else {
@@ -2001,7 +2029,16 @@ impl NPortController {
                 .position(|&b| b == ps.baud)
                 .unwrap_or(3);
             ps.baud = STANDARD_BAUDS[(idx + 1) % STANDARD_BAUDS.len()];
-            (simulate, ps.baud, ps.framing, ps.dtr, ps.rts, ps.flow_control)
+            (
+                simulate,
+                ps.baud,
+                ps.framing,
+                ps.dtr,
+                ps.rts,
+                ps.flow_control,
+                ps.op_mode.clone(),
+                ps.alias.clone(),
+            )
         };
         if simulate {
             let mut st = self.state.lock().unwrap();
@@ -2017,10 +2054,22 @@ impl NPortController {
         {
             Ok((hw_baud, hw_framing, _)) => {
                 let mut st = self.state.lock().unwrap();
-                st.log_event(format!(
-                    "Port {port_num} baud set to {next_baud} bps (NPort DSU 0x31 verified: {hw_baud} {})",
-                    hw_framing.as_str()
-                ));
+                if hw_baud == next_baud {
+                    st.log_event(format!(
+                        "Port {port_num} baud set to {next_baud} bps (NPort DSU 0x31 verified: {hw_baud} {})",
+                        hw_framing.as_str()
+                    ));
+                } else {
+                    let name = if alias.is_empty() {
+                        format!("P{port_num}")
+                    } else {
+                        format!("P{port_num} ({alias})")
+                    };
+                    st.log_event(format!(
+                        "WARNING: {name} is in {op_mode} mode; NPort 5610 only applies runtime ASPP 0x2C baud changes on RealCOM ports (remained {hw_baud} {})",
+                        hw_framing.as_str()
+                    ));
+                }
             }
             Err(e) => {
                 let mut st = self.state.lock().unwrap();
@@ -2032,14 +2081,23 @@ impl NPortController {
     }
 
     pub async fn cycle_framing(&self, port_num: u8) {
-        let (simulate, baud, next_framing, dtr, rts, flow) = {
+        let (simulate, baud, next_framing, dtr, rts, flow, op_mode, alias) = {
             let mut st = self.state.lock().unwrap();
             let simulate = st.simulate;
             let Some(ps) = st.ports.get_mut((port_num - 1) as usize) else {
                 return;
             };
             ps.framing = ps.framing.next();
-            (simulate, ps.baud, ps.framing, ps.dtr, ps.rts, ps.flow_control)
+            (
+                simulate,
+                ps.baud,
+                ps.framing,
+                ps.dtr,
+                ps.rts,
+                ps.flow_control,
+                ps.op_mode.clone(),
+                ps.alias.clone(),
+            )
         };
         if simulate {
             let mut st = self.state.lock().unwrap();
@@ -2055,11 +2113,23 @@ impl NPortController {
         {
             Ok((hw_baud, hw_framing, _)) => {
                 let mut st = self.state.lock().unwrap();
-                st.log_event(format!(
-                    "Port {port_num} framing set to {} (NPort DSU 0x31 verified: {hw_baud} {})",
-                    next_framing.as_str(),
-                    hw_framing.as_str()
-                ));
+                if hw_framing == next_framing {
+                    st.log_event(format!(
+                        "Port {port_num} framing set to {} (NPort DSU 0x31 verified: {hw_baud} {})",
+                        next_framing.as_str(),
+                        hw_framing.as_str()
+                    ));
+                } else {
+                    let name = if alias.is_empty() {
+                        format!("P{port_num}")
+                    } else {
+                        format!("P{port_num} ({alias})")
+                    };
+                    st.log_event(format!(
+                        "WARNING: {name} is in {op_mode} mode; NPort 5610 only applies runtime ASPP 0x2C framing changes on RealCOM ports (remained {hw_baud} {})",
+                        hw_framing.as_str()
+                    ));
+                }
             }
             Err(e) => {
                 let mut st = self.state.lock().unwrap();
