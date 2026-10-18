@@ -139,8 +139,8 @@ pub const ASPP_CMD_LINECTRL: u8 = 0x12;
 pub const ASPP_CMD_LSTATUS: u8 = 0x13;
 pub const ASPP_CMD_FLUSH: u8 = 0x14;
 pub const ASPP_CMD_SET_BREAK: u8 = 0x15;
+pub const ASPP_CMD_BAUDRATE: u8 = 0x17;
 pub const ASPP_CMD_STOP_BREAK: u8 = 0x21;
-pub const ASPP_CMD_BAUDRATE: u8 = 0x23;
 
 pub const STANDARD_BAUDS: [u32; 9] = [
     1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400,
@@ -295,6 +295,7 @@ pub mod aspp_codec {
         [ASPP_CMD_STOP_BREAK, 0x00]
     }
 
+    /// Encode the 6-byte Moxa `ASPP_CMD_SETBAUD` (`0x17`) exact 32-bit baud rate packet verified on NPort 5610-8-DT.
     pub fn encode_exact_baud(baud: u32) -> [u8; 6] {
         let le = baud.to_le_bytes();
         [ASPP_CMD_BAUDRATE, 0x04, le[0], le[1], le[2], le[3]]
@@ -345,17 +346,33 @@ impl AsppClient {
         dtr: bool,
         rts: bool,
     ) -> Result<()> {
-        // Send 0x2C (ASPP_CMD_PORT_INIT, supported in Real COM & TCP Server modes on NPort 5610)
-        let pkt = aspp_codec::encode_port_init(baud, framing, dtr, rts);
-        let resp = self.transact(&pkt).await?;
-        if resp.first().copied() == Some(aspp_codec::ASPP_CMD_PORT_INIT)
-            || resp.first().copied() == Some(ASPP_CMD_INIT)
-        {
+        let addr = format!("{}:{}", self.host, self.cmd_tcp_port());
+        let mut stream = tokio::time::timeout(self.timeout, TcpStream::connect(&addr))
+            .await
+            .context("ASPP TCP connect timeout")?
+            .context("ASPP TCP connect error")?;
+        let _ = stream.set_nodelay(true);
+
+        // 1. Send 0x2C (ASPP_CMD_PORT_INIT)
+        let init_pkt = aspp_codec::encode_port_init(baud, framing, dtr, rts);
+        stream.write_all(&init_pkt).await?;
+        let mut buf = [0u8; 32];
+        let _ = tokio::time::timeout(self.timeout, stream.read(&mut buf)).await;
+
+        // 2. Send 0x17 (ASPP_CMD_SETBAUD exact 32-bit baud rate)
+        let baud_pkt = aspp_codec::encode_exact_baud(baud);
+        stream.write_all(&baud_pkt).await?;
+        let n = tokio::time::timeout(self.timeout, stream.read(&mut buf))
+            .await
+            .context("ASPP SETBAUD read timeout")?
+            .context("ASPP SETBAUD read error")?;
+
+        if n > 0 && (buf[0] == ASPP_CMD_BAUDRATE || buf[0] == aspp_codec::ASPP_CMD_PORT_INIT) {
             Ok(())
         } else {
             Err(anyhow!(
                 "Unexpected ASPP UART config response: {:02X?}",
-                resp
+                &buf[..n]
             ))
         }
     }
@@ -976,6 +993,7 @@ pub struct SharedEngineState {
     last_instant: Option<Instant>,
     last_payload_by_dir: HashMap<String, Vec<u8>>,
     tx_senders: HashMap<u8, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    cmd_senders: HashMap<u8, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     mitm_peer: HashMap<u8, u8>,
 }
 
@@ -1035,6 +1053,7 @@ impl SharedEngineState {
             last_instant: None,
             last_payload_by_dir: HashMap::new(),
             tx_senders: HashMap::new(),
+            cmd_senders: HashMap::new(),
             mitm_peer: HashMap::new(),
         };
         st.log_event(format!(
@@ -1409,6 +1428,33 @@ impl NPortController {
         let mut realcom_ports = 0usize;
         let mut tcpsrv_ports = 0usize;
         for p in 1..=port_count {
+            let (already_data, already_cmd, cur_port, baud, framing, dtr, rts) = {
+                let st = self.state.lock().unwrap();
+                let data_active = st.tx_senders.contains_key(&p);
+                let cmd_active = st.cmd_senders.contains_key(&p);
+                let (cur_port, baud, framing, dtr, rts) = st
+                    .ports
+                    .get((p - 1) as usize)
+                    .map(|ps| (ps.active_data_port, ps.baud, ps.framing, ps.dtr, ps.rts))
+                    .unwrap_or((949 + u16::from(p), 9600, UartFraming::F8N1, true, true));
+                (data_active, cmd_active, cur_port, baud, framing, dtr, rts)
+            };
+
+            if already_data || already_cmd {
+                reachable += 1;
+                if cur_port < 1000 {
+                    realcom_ports += 1;
+                } else {
+                    tcpsrv_ports += 1;
+                }
+                if let Ok(cmd_tx) = self.ensure_aspp_cmd_channel(p).await {
+                    let mut payload = aspp_codec::encode_port_init(baud, framing, dtr, rts).to_vec();
+                    payload.extend_from_slice(&aspp_codec::encode_exact_baud(baud));
+                    let _ = cmd_tx.send(payload);
+                }
+                continue;
+            }
+
             let tcp_srv_port = 4000 + u16::from(p);
             let realcom_port = 949 + u16::from(p);
             let cmd_port = 965 + u16::from(p);
@@ -1441,15 +1487,6 @@ impl NPortController {
             .map(|r| r.is_ok())
             .unwrap_or(false);
 
-            let modem = if cmd_ok {
-                AsppClient::new(&host, p)
-                    .query_modem_status()
-                    .await
-                    .unwrap_or_default()
-            } else {
-                ModemStatus::default()
-            };
-
             let data_ok = tcpsrv_ok || realcom_ok;
             let active_data_port = if tcpsrv_ok {
                 tcpsrv_ports += 1;
@@ -1469,7 +1506,6 @@ impl NPortController {
                 ps.active_data_port = active_data_port;
                 ps.tcp_data_open = data_ok;
                 ps.aspp_cmd_open = cmd_ok;
-                ps.modem = modem;
             }
         }
         let mut st = self.state.lock().unwrap();
@@ -1486,10 +1522,100 @@ impl NPortController {
         ));
     }
 
-    pub async fn cycle_baud(&self, port_num: u8) {
-        let (host, simulate, next_baud, framing, dtr, rts) = {
+    /// Ensure a persistent TCP connection to the port's ASPP Command port (`965 + port_num`)
+    /// is open and return its command sender channel.
+    ///
+    /// On Moxa NPort 5610 units in Real COM / ASPP mode, closing the `:966..973` TCP socket
+    /// causes the firmware to immediately reset the UART baud rate and framing back to NVRAM defaults.
+    async fn ensure_aspp_cmd_channel(
+        &self,
+        port_num: u8,
+    ) -> Result<tokio::sync::mpsc::UnboundedSender<Vec<u8>>, String> {
+        let (host, baud, framing, dtr, rts) = {
             let mut st = self.state.lock().unwrap();
-            let host = st.host.clone();
+            if let Some(existing) = st.cmd_senders.get(&port_num) {
+                if !existing.is_closed() {
+                    return Ok(existing.clone());
+                }
+                st.cmd_senders.remove(&port_num);
+            }
+            let (baud, framing, dtr, rts) = st
+                .ports
+                .get((port_num - 1) as usize)
+                .map(|p| (p.baud, p.framing, p.dtr, p.rts))
+                .unwrap_or((9600, UartFraming::F8N1, true, true));
+            (st.host.clone(), baud, framing, dtr, rts)
+        };
+
+        let cmd_port = 965 + u16::from(port_num);
+        let addr = format!("{host}:{cmd_port}");
+        let stream = tokio::time::timeout(Duration::from_millis(800), TcpStream::connect(&addr))
+            .await
+            .map_err(|_| format!("timeout connecting to ASPP {addr}"))?
+            .map_err(|e| format!("ASPP {addr}: {e}"))?;
+
+        let _ = stream.set_nodelay(true);
+        let (mut cmd_reader, mut cmd_writer) = stream.into_split();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+        // Immediately initialise the UART on this persistent command socket
+        let mut init_payload = aspp_codec::encode_port_init(baud, framing, dtr, rts).to_vec();
+        init_payload.extend_from_slice(&aspp_codec::encode_exact_baud(baud));
+        let _ = cmd_tx.send(init_payload);
+
+        {
+            let mut st = self.state.lock().unwrap();
+            st.cmd_senders.insert(port_num, cmd_tx.clone());
+            if let Some(ps) = st.ports.get_mut((port_num - 1) as usize) {
+                ps.aspp_cmd_open = true;
+            }
+        }
+
+        tokio::spawn(async move {
+            while let Some(pkt) = cmd_rx.recv().await {
+                if cmd_writer.write_all(&pkt).await.is_err() {
+                    break;
+                }
+                let _ = cmd_writer.flush().await;
+            }
+        });
+
+        let state_arc = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 128];
+            while let Ok(n) = cmd_reader.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                let slice = &buf[..n];
+                let mut st = state_arc.lock().unwrap();
+                if let Some(ps) = st.ports.get_mut((port_num - 1) as usize) {
+                    // Parse 0x2C (ASPP_CMD_PORT_INIT reply: 2C 03 <modem> 00 00)
+                    // or 0x26 (ASPP_NOTIFY: 26 00 <line_status> <modem_status>)
+                    let mut i = 0;
+                    while i < slice.len() {
+                        if slice[i] == aspp_codec::ASPP_CMD_PORT_INIT && i + 2 < slice.len() {
+                            ps.modem = ModemStatus::from_aspp_byte(slice[i + 2]);
+                            i += 5;
+                        } else if slice[i] == 0x26 && i + 3 < slice.len() {
+                            ps.modem = ModemStatus::from_aspp_byte(slice[i + 3]);
+                            i += 4;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            let mut st = state_arc.lock().unwrap();
+            st.cmd_senders.remove(&port_num);
+        });
+
+        Ok(cmd_tx)
+    }
+
+    pub async fn cycle_baud(&self, port_num: u8) {
+        let (simulate, next_baud, framing, dtr, rts) = {
+            let mut st = self.state.lock().unwrap();
             let simulate = st.simulate;
             let Some(ps) = st.ports.get_mut((port_num - 1) as usize) else {
                 return;
@@ -1499,7 +1625,7 @@ impl NPortController {
                 .position(|&b| b == ps.baud)
                 .unwrap_or(3);
             ps.baud = STANDARD_BAUDS[(idx + 1) % STANDARD_BAUDS.len()];
-            (host, simulate, ps.baud, ps.framing, ps.dtr, ps.rts)
+            (simulate, ps.baud, ps.framing, ps.dtr, ps.rts)
         };
         if simulate {
             let mut st = self.state.lock().unwrap();
@@ -1509,30 +1635,36 @@ impl NPortController {
             ));
             return;
         }
-        let res = AsppClient::new(host, port_num)
-            .configure_uart(next_baud, framing, dtr, rts)
-            .await;
-        let mut st = self.state.lock().unwrap();
-        match res {
-            Ok(()) => st.log_event(format!(
-                "Port {port_num} baud set to {next_baud} bps via ASPP"
-            )),
-            Err(e) => st.log_event(format!(
-                "WARNING: Port {port_num} ASPP baud update failed: {e}"
-            )),
+        match self.ensure_aspp_cmd_channel(port_num).await {
+            Ok(cmd_tx) => {
+                let mut payload =
+                    aspp_codec::encode_port_init(next_baud, framing, dtr, rts).to_vec();
+                payload.extend_from_slice(&aspp_codec::encode_exact_baud(next_baud));
+                let _ = cmd_tx.send(payload);
+                let mut st = self.state.lock().unwrap();
+                st.log_event(format!(
+                    "Port {port_num} baud set to {next_baud} bps via persistent ASPP :{}",
+                    965 + u16::from(port_num)
+                ));
+            }
+            Err(e) => {
+                let mut st = self.state.lock().unwrap();
+                st.log_event(format!(
+                    "WARNING: Port {port_num} ASPP baud update failed: {e}"
+                ));
+            }
         }
     }
 
     pub async fn cycle_framing(&self, port_num: u8) {
-        let (host, simulate, baud, next_framing, dtr, rts) = {
+        let (simulate, baud, next_framing, dtr, rts) = {
             let mut st = self.state.lock().unwrap();
-            let host = st.host.clone();
             let simulate = st.simulate;
             let Some(ps) = st.ports.get_mut((port_num - 1) as usize) else {
                 return;
             };
             ps.framing = ps.framing.next();
-            (host, simulate, ps.baud, ps.framing, ps.dtr, ps.rts)
+            (simulate, ps.baud, ps.framing, ps.dtr, ps.rts)
         };
         if simulate {
             let mut st = self.state.lock().unwrap();
@@ -1542,9 +1674,11 @@ impl NPortController {
             ));
             return;
         }
-        let _ = AsppClient::new(host, port_num)
-            .configure_uart(baud, next_framing, dtr, rts)
-            .await;
+        if let Ok(cmd_tx) = self.ensure_aspp_cmd_channel(port_num).await {
+            let mut payload = aspp_codec::encode_port_init(baud, next_framing, dtr, rts).to_vec();
+            payload.extend_from_slice(&aspp_codec::encode_exact_baud(baud));
+            let _ = cmd_tx.send(payload);
+        }
         let mut st = self.state.lock().unwrap();
         st.log_event(format!(
             "Port {port_num} framing set to {} via ASPP",
@@ -1553,20 +1687,19 @@ impl NPortController {
     }
 
     pub async fn toggle_dtr(&self, port_num: u8) {
-        let (host, simulate, dtr, rts) = {
+        let (simulate, dtr, rts) = {
             let mut st = self.state.lock().unwrap();
-            let host = st.host.clone();
             let simulate = st.simulate;
             let Some(ps) = st.ports.get_mut((port_num - 1) as usize) else {
                 return;
             };
             ps.dtr = !ps.dtr;
-            (host, simulate, ps.dtr, ps.rts)
+            (simulate, ps.dtr, ps.rts)
         };
         if !simulate {
-            let _ = AsppClient::new(host, port_num)
-                .set_line_control(dtr, rts)
-                .await;
+            if let Ok(cmd_tx) = self.ensure_aspp_cmd_channel(port_num).await {
+                let _ = cmd_tx.send(aspp_codec::encode_linectrl(dtr, rts).to_vec());
+            }
         }
         let mut st = self.state.lock().unwrap();
         st.log_event(format!(
@@ -1576,20 +1709,19 @@ impl NPortController {
     }
 
     pub async fn toggle_rts(&self, port_num: u8) {
-        let (host, simulate, dtr, rts) = {
+        let (simulate, dtr, rts) = {
             let mut st = self.state.lock().unwrap();
-            let host = st.host.clone();
             let simulate = st.simulate;
             let Some(ps) = st.ports.get_mut((port_num - 1) as usize) else {
                 return;
             };
             ps.rts = !ps.rts;
-            (host, simulate, ps.dtr, ps.rts)
+            (simulate, ps.dtr, ps.rts)
         };
         if !simulate {
-            let _ = AsppClient::new(host, port_num)
-                .set_line_control(dtr, rts)
-                .await;
+            if let Ok(cmd_tx) = self.ensure_aspp_cmd_channel(port_num).await {
+                let _ = cmd_tx.send(aspp_codec::encode_linectrl(dtr, rts).to_vec());
+            }
         }
         let mut st = self.state.lock().unwrap();
         st.log_event(format!(
@@ -1599,12 +1731,11 @@ impl NPortController {
     }
 
     pub async fn flush_fifo(&self, port_num: u8) {
-        let (host, simulate) = {
-            let st = self.state.lock().unwrap();
-            (st.host.clone(), st.simulate)
-        };
+        let simulate = { self.state.lock().unwrap().simulate };
         if !simulate {
-            let _ = AsppClient::new(host, port_num).flush_buffers().await;
+            if let Ok(cmd_tx) = self.ensure_aspp_cmd_channel(port_num).await {
+                let _ = cmd_tx.send(aspp_codec::encode_flush(0x02).to_vec());
+            }
         }
         let mut st = self.state.lock().unwrap();
         st.log_event(format!(
@@ -1613,14 +1744,13 @@ impl NPortController {
     }
 
     pub async fn send_break(&self, port_num: u8) {
-        let (host, simulate) = {
-            let st = self.state.lock().unwrap();
-            (st.host.clone(), st.simulate)
-        };
+        let simulate = { self.state.lock().unwrap().simulate };
         if !simulate {
-            let _ = AsppClient::new(host, port_num)
-                .send_break(Duration::from_millis(250))
-                .await;
+            if let Ok(cmd_tx) = self.ensure_aspp_cmd_channel(port_num).await {
+                let _ = cmd_tx.send(aspp_codec::encode_set_break().to_vec());
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let _ = cmd_tx.send(aspp_codec::encode_stop_break().to_vec());
+            }
         }
         let mut st = self.state.lock().unwrap();
         st.log_event(format!(
@@ -1647,6 +1777,13 @@ impl NPortController {
                 .unwrap_or((9600, UartFraming::F8N1, true, true));
             (st.host.clone(), st.gap_ms, baud, framing, dtr, rts)
         };
+
+        // Open and hold the persistent ASPP Command socket (:966..973) FIRST so RealCOM UART config stays locked
+        if let Ok(cmd_tx) = self.ensure_aspp_cmd_channel(port_num).await {
+            let mut payload = aspp_codec::encode_port_init(baud, framing, dtr, rts).to_vec();
+            payload.extend_from_slice(&aspp_codec::encode_exact_baud(baud));
+            let _ = cmd_tx.send(payload);
+        }
 
         // Try TCP Server Mode (:4001..4016) first, then automatically fall back to Real COM Mode (:950..965)
         let tcp_srv_port = 4000 + u16::from(port_num);
@@ -1686,10 +1823,12 @@ impl NPortController {
             }
         };
 
-        // Initialise UART parameters via ASPP 0x2C on :966+ so RealCOM / TCP Server port activates
-        let _ = AsppClient::new(&host, port_num)
-            .configure_uart(baud, framing, dtr, rts)
-            .await;
+        // Re-assert UART baud & framing after Data socket connects so the NPort 5610 applies our exact baud rate
+        if let Ok(cmd_tx) = self.ensure_aspp_cmd_channel(port_num).await {
+            let mut payload = aspp_codec::encode_port_init(baud, framing, dtr, rts).to_vec();
+            payload.extend_from_slice(&aspp_codec::encode_exact_baud(baud));
+            let _ = cmd_tx.send(payload);
+        }
 
         let addr = format!("{host}:{chosen_port}");
         let _ = stream.set_nodelay(true);
@@ -1711,7 +1850,8 @@ impl NPortController {
                 "TCP-Srv"
             };
             st.log_event(format!(
-                "Connected Port {port_num} ({addr} {mode_tag}) [{role}]"
+                "Connected Port {port_num} ({addr} {mode_tag} @ {baud} {}) [{role}]",
+                framing.as_str()
             ));
         }
 
@@ -1803,6 +1943,7 @@ impl NPortController {
     pub fn disconnect_port(&self, port_num: u8) {
         let mut st = self.state.lock().unwrap();
         st.tx_senders.remove(&port_num);
+        st.cmd_senders.remove(&port_num);
         if let Some(peer) = st.mitm_peer.remove(&port_num) {
             st.mitm_peer.remove(&peer);
         }
@@ -1819,6 +1960,7 @@ impl NPortController {
         for p in 1..=max_p {
             let mut st = self.state.lock().unwrap();
             st.tx_senders.remove(&p);
+            st.cmd_senders.remove(&p);
             st.mitm_peer.remove(&p);
             if let Some(ps) = st.ports.get_mut((p - 1) as usize) {
                 ps.connected = false;
@@ -1964,7 +2106,7 @@ mod tests {
         assert_eq!(line_pkt, [0x12, 0x02, 0, 1]);
 
         let baud_pkt = aspp_codec::encode_exact_baud(115200);
-        assert_eq!(baud_pkt, [0x23, 0x04, 0x00, 0xC2, 0x01, 0x00]);
+        assert_eq!(baud_pkt, [0x17, 0x04, 0x00, 0xC2, 0x01, 0x00]);
     }
 
     #[test]
