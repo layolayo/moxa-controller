@@ -617,10 +617,15 @@ impl eframe::App for SmtGuiApp {
 
                     for ps in &ports {
                         let is_sel = ps.port_num == self.selected_port;
-                        let btn_label = if is_sel {
-                            format!("▶ Port {}", ps.port_num)
+                        let name_suffix = if ps.alias.is_empty() {
+                            String::new()
                         } else {
-                            format!("  Port {}", ps.port_num)
+                            format!(" ({})", ps.alias)
+                        };
+                        let btn_label = if is_sel {
+                            format!("▶ Port {}{}", ps.port_num, name_suffix)
+                        } else {
+                            format!("  Port {}{}", ps.port_num, name_suffix)
                         };
                         let btn = egui::Button::new(
                             RichText::new(btn_label)
@@ -651,7 +656,12 @@ impl eframe::App for SmtGuiApp {
                         } else {
                             Color32::GRAY
                         };
-                        ui.label(RichText::new(&ps.role).color(role_col).monospace().strong());
+                        let role_lbl = if ps.role == "IDLE" {
+                            format!("IDLE ({})", ps.op_mode)
+                        } else {
+                            ps.role.clone()
+                        };
+                        ui.label(RichText::new(role_lbl).color(role_col).monospace().strong());
 
                         ui.label(
                             RichText::new(format!("{} {}", ps.baud, ps.framing.as_str()))

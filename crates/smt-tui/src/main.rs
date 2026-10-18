@@ -166,11 +166,22 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
             Style::default().fg(Color::White)
         };
 
+        let port_label = if ps.alias.is_empty() {
+            format!("{marker}P{}", ps.port_num)
+        } else {
+            format!("{marker}P{} {}", ps.port_num, ps.alias)
+        };
+        let role_label = if ps.role == "IDLE" {
+            format!("IDLE ({})", ps.op_mode)
+        } else {
+            ps.role.clone()
+        };
+
         Row::new(vec![
-            Cell::from(format!("{marker}P{}", ps.port_num)),
+            Cell::from(port_label),
             Cell::from(format!(":{}", ps.data_tcp_port())),
             Cell::from(format!(":{}", ps.aspp_tcp_port())),
-            Cell::from(ps.role.clone()),
+            Cell::from(role_label),
             Cell::from(format!("{:>6} {}", ps.baud, ps.framing.as_str())),
             Cell::from(format!(
                 "DTR:{} RTS:{}",
@@ -190,7 +201,7 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
     });
 
     let widths = [
-        Constraint::Length(7),
+        Constraint::Length(12),
         Constraint::Length(7),
         Constraint::Length(7),
         Constraint::Length(18),
@@ -575,16 +586,26 @@ fn print_snapshot(ctrl: &NPortController) {
         st.discovery_method
     );
     println!(
-        "PORT  DATA    ASPP   ROLE              UART        OUT(DTR/RTS)  IN(CTS/DSR/DCD)   RX(F/B)      TX(F/B)"
+        "PORT         DATA    ASPP   ROLE              UART        OUT(DTR/RTS)  IN(CTS/DSR/DCD)   RX(F/B)      TX(F/B)"
     );
-    println!("{}", "-".repeat(106));
+    println!("{}", "-".repeat(113));
     for ps in &st.ports {
+        let port_lbl = if ps.alias.is_empty() {
+            format!("P{}", ps.port_num)
+        } else {
+            format!("P{} {}", ps.port_num, ps.alias)
+        };
+        let role_lbl = if ps.role == "IDLE" {
+            format!("IDLE ({})", ps.op_mode)
+        } else {
+            ps.role.clone()
+        };
         println!(
-            "P{:<2}  :{:<5} :{:<4}  {:<16}  {:>6} {}  DTR:{} RTS:{}   CTS:{} DSR:{} DCD:{}    {:>3}/{:>5}B   {:>3}/{:>5}B",
-            ps.port_num,
+            "{:<11}  :{:<5} :{:<4}  {:<16}  {:>6} {}  DTR:{} RTS:{}   CTS:{} DSR:{} DCD:{}    {:>3}/{:>5}B   {:>3}/{:>5}B",
+            port_lbl,
             ps.data_tcp_port(),
             ps.aspp_tcp_port(),
-            ps.role,
+            role_lbl,
             ps.baud,
             ps.framing.as_str(),
             u8::from(ps.dtr),
@@ -598,7 +619,7 @@ fn print_snapshot(ctrl: &NPortController) {
             ps.tx_bytes
         );
     }
-    println!("{}", "-".repeat(106));
+    println!("{}", "-".repeat(113));
     for fr in st.frames.iter().rev().take(6).rev() {
         println!(
             "#{:<3} [{} +{:>6.2}ms] {:<14} ({:>2}B) | {:<42} | {:<16} | XOR:{:02X} LRC:{:02X} CRC16:{:04X} | Diff:{:?}",
