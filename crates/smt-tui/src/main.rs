@@ -619,7 +619,7 @@ fn print_snapshot(ctrl: &NPortController) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut host = String::from("192.168.127.254");
+    let mut host = String::from("192.168.1.249");
     let mut demo = false;
     let mut snapshot = false;
     let mut start_log: Option<String> = None;

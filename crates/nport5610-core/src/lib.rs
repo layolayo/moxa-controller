@@ -246,6 +246,8 @@ impl ModemStatus {
 pub mod aspp_codec {
     use super::*;
 
+    pub const ASPP_CMD_PORT_INIT: u8 = 0x2C;
+
     pub fn encode_init(baud: u32, framing: UartFraming, dtr: bool, rts: bool) -> [u8; 6] {
         [
             ASPP_CMD_INIT,
@@ -254,6 +256,22 @@ pub mod aspp_codec {
             framing.mode_byte(),
             u8::from(dtr),
             u8::from(rts),
+        ]
+    }
+
+    /// Encode the 10-byte Moxa RealCOM `ASPP_CMD_PORT_INIT` (`0x2C`) packet verified on NPort 5610-8-DT.
+    pub fn encode_port_init(baud: u32, framing: UartFraming, dtr: bool, rts: bool) -> [u8; 10] {
+        [
+            ASPP_CMD_PORT_INIT,
+            0x08,
+            aspp_baud_index(baud),
+            framing.mode_byte(),
+            u8::from(dtr),
+            u8::from(rts),
+            0x00, // XON/XOFF off
+            0x00, // Error mode
+            0x01, // FIFO enable
+            0x00,
         ]
     }
 
@@ -295,7 +313,7 @@ impl AsppClient {
         Self {
             host: host.into(),
             port_num: port_num.clamp(1, 16),
-            timeout: Duration::from_millis(800),
+            timeout: Duration::from_millis(600),
         }
     }
 
@@ -327,12 +345,18 @@ impl AsppClient {
         dtr: bool,
         rts: bool,
     ) -> Result<()> {
-        let pkt = aspp_codec::encode_init(baud, framing, dtr, rts);
+        // Send 0x2C (ASPP_CMD_PORT_INIT, supported in Real COM & TCP Server modes on NPort 5610)
+        let pkt = aspp_codec::encode_port_init(baud, framing, dtr, rts);
         let resp = self.transact(&pkt).await?;
-        if resp.first().copied() == Some(ASPP_CMD_INIT) {
+        if resp.first().copied() == Some(aspp_codec::ASPP_CMD_PORT_INIT)
+            || resp.first().copied() == Some(ASPP_CMD_INIT)
+        {
             Ok(())
         } else {
-            Err(anyhow!("Unexpected ASPP CMD_INIT response: {:02X?}", resp))
+            Err(anyhow!(
+                "Unexpected ASPP UART config response: {:02X?}",
+                resp
+            ))
         }
     }
 
@@ -360,6 +384,13 @@ impl AsppClient {
     }
 
     pub async fn query_modem_status(&self) -> Result<ModemStatus> {
+        // Send 0x2C Port Init query or 0x13 LSTATUS to read live modem status bits
+        let pkt = aspp_codec::encode_port_init(9600, UartFraming::F8N1, true, true);
+        if let Ok(resp) = self.transact(&pkt).await {
+            if resp.len() >= 5 && resp[0] == aspp_codec::ASPP_CMD_PORT_INIT {
+                return Ok(ModemStatus::from_aspp_byte(resp[2]));
+            }
+        }
         let resp = self.transact(&aspp_codec::encode_lstatus()).await?;
         if resp.len() >= 3 && resp[0] == ASPP_CMD_LSTATUS {
             Ok(ModemStatus::from_aspp_byte(resp[2]))
@@ -681,6 +712,7 @@ pub struct PortState {
     pub dtr: bool,
     pub rts: bool,
     pub modem: ModemStatus,
+    pub active_data_port: u16,
     pub tcp_data_open: bool,
     pub aspp_cmd_open: bool,
     pub connected: bool,
@@ -700,6 +732,7 @@ impl PortState {
             dtr: true,
             rts: true,
             modem: ModemStatus::default(),
+            active_data_port: 949 + u16::from(port_num),
             tcp_data_open: false,
             aspp_cmd_open: false,
             connected: false,
@@ -712,7 +745,7 @@ impl PortState {
     }
 
     pub fn data_tcp_port(&self) -> u16 {
-        4000 + u16::from(self.port_num)
+        self.active_data_port
     }
 
     pub fn aspp_tcp_port(&self) -> u16 {
@@ -1373,19 +1406,36 @@ impl NPortController {
         }
 
         let mut reachable = 0usize;
+        let mut realcom_ports = 0usize;
+        let mut tcpsrv_ports = 0usize;
         for p in 1..=port_count {
-            let data_addr = format!("{host}:{}", 4000 + u16::from(p));
-            let cmd_addr = format!("{host}:{}", 965 + u16::from(p));
-            let data_ok = tokio::time::timeout(
-                Duration::from_millis(250),
-                TcpStream::connect(&data_addr),
+            let tcp_srv_port = 4000 + u16::from(p);
+            let realcom_port = 949 + u16::from(p);
+            let cmd_port = 965 + u16::from(p);
+
+            let tcpsrv_ok = tokio::time::timeout(
+                Duration::from_millis(200),
+                TcpStream::connect(format!("{host}:{tcp_srv_port}")),
             )
             .await
             .map(|r| r.is_ok())
             .unwrap_or(false);
+
+            let realcom_ok = if !tcpsrv_ok {
+                tokio::time::timeout(
+                    Duration::from_millis(200),
+                    TcpStream::connect(format!("{host}:{realcom_port}")),
+                )
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false)
+            } else {
+                false
+            };
+
             let cmd_ok = tokio::time::timeout(
-                Duration::from_millis(250),
-                TcpStream::connect(&cmd_addr),
+                Duration::from_millis(200),
+                TcpStream::connect(format!("{host}:{cmd_port}")),
             )
             .await
             .map(|r| r.is_ok())
@@ -1400,11 +1450,23 @@ impl NPortController {
                 ModemStatus::default()
             };
 
+            let data_ok = tcpsrv_ok || realcom_ok;
+            let active_data_port = if tcpsrv_ok {
+                tcpsrv_ports += 1;
+                tcp_srv_port
+            } else {
+                if realcom_ok {
+                    realcom_ports += 1;
+                }
+                realcom_port
+            };
+
             if data_ok || cmd_ok {
                 reachable += 1;
             }
             let mut st = self.state.lock().unwrap();
             if let Some(ps) = st.ports.get_mut((p - 1) as usize) {
+                ps.active_data_port = active_data_port;
                 ps.tcp_data_open = data_ok;
                 ps.aspp_cmd_open = cmd_ok;
                 ps.modem = modem;
@@ -1412,8 +1474,15 @@ impl NPortController {
         }
         let mut st = self.state.lock().unwrap();
         let model_name = st.profile.model_name.clone();
+        let mode_note = if realcom_ports > 0 && tcpsrv_ports == 0 {
+            "Real COM Mode (Data :950.. / ASPP :966..)"
+        } else if tcpsrv_ports > 0 {
+            "TCP Server Mode (Data :4001.. / ASPP :966..)"
+        } else {
+            "No open serial sockets"
+        };
         st.log_event(format!(
-            "Probed {host} ({model_name}): {reachable}/{port_count} serial ports reachable"
+            "Probed {host} ({model_name}): {reachable}/{port_count} ports online [{mode_note}]"
         ));
     }
 
@@ -1561,7 +1630,7 @@ impl NPortController {
 
     pub async fn connect_port(&self, port_num: u8, role: impl Into<String>) -> bool {
         let role = role.into();
-        let (host, gap_ms) = {
+        let (host, gap_ms, baud, framing, dtr, rts) = {
             let mut st = self.state.lock().unwrap();
             if st.simulate {
                 if let Some(ps) = st.ports.get_mut((port_num - 1) as usize) {
@@ -1571,32 +1640,58 @@ impl NPortController {
                 st.log_event(format!("Connected Port {port_num} in {role} mode [DEMO]"));
                 return true;
             }
-            (st.host.clone(), st.gap_ms)
+            let (baud, framing, dtr, rts) = st
+                .ports
+                .get((port_num - 1) as usize)
+                .map(|p| (p.baud, p.framing, p.dtr, p.rts))
+                .unwrap_or((9600, UartFraming::F8N1, true, true));
+            (st.host.clone(), st.gap_ms, baud, framing, dtr, rts)
         };
 
-        let addr = format!("{host}:{}", 4000 + u16::from(port_num));
+        // Try TCP Server Mode (:4001..4016) first, then automatically fall back to Real COM Mode (:950..965)
+        let tcp_srv_port = 4000 + u16::from(port_num);
+        let realcom_port = 949 + u16::from(port_num);
+        let mut chosen_port = tcp_srv_port;
+
         let stream = match tokio::time::timeout(
-            Duration::from_millis(1200),
-            TcpStream::connect(&addr),
+            Duration::from_millis(500),
+            TcpStream::connect(format!("{host}:{tcp_srv_port}")),
         )
         .await
         {
             Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                self.state
-                    .lock()
-                    .unwrap()
-                    .log_event(format!("ERROR connecting Port {port_num} ({addr}): {e}"));
-                return false;
-            }
-            Err(_) => {
-                self.state
-                    .lock()
-                    .unwrap()
-                    .log_event(format!("ERROR timeout connecting Port {port_num} ({addr})"));
-                return false;
+            _ => {
+                chosen_port = realcom_port;
+                let addr = format!("{host}:{realcom_port}");
+                match tokio::time::timeout(
+                    Duration::from_millis(900),
+                    TcpStream::connect(&addr),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        self.state.lock().unwrap().log_event(format!(
+                            "ERROR connecting Port {port_num} (tried :{tcp_srv_port} & :{realcom_port}): {e}"
+                        ));
+                        return false;
+                    }
+                    Err(_) => {
+                        self.state.lock().unwrap().log_event(format!(
+                            "ERROR timeout connecting Port {port_num} (:{tcp_srv_port} / :{realcom_port})"
+                        ));
+                        return false;
+                    }
+                }
             }
         };
+
+        // Initialise UART parameters via ASPP 0x2C on :966+ so RealCOM / TCP Server port activates
+        let _ = AsppClient::new(&host, port_num)
+            .configure_uart(baud, framing, dtr, rts)
+            .await;
+
+        let addr = format!("{host}:{chosen_port}");
         let _ = stream.set_nodelay(true);
         let (mut reader, mut writer) = stream.into_split();
         let (tx_chan, mut rx_chan) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -1605,11 +1700,19 @@ impl NPortController {
             let mut st = self.state.lock().unwrap();
             st.tx_senders.insert(port_num, tx_chan);
             if let Some(ps) = st.ports.get_mut((port_num - 1) as usize) {
+                ps.active_data_port = chosen_port;
                 ps.connected = true;
                 ps.tcp_data_open = true;
                 ps.role = role.clone();
             }
-            st.log_event(format!("Connected Port {port_num} ({addr}) [{role}]"));
+            let mode_tag = if chosen_port < 1000 {
+                "RealCOM"
+            } else {
+                "TCP-Srv"
+            };
+            st.log_event(format!(
+                "Connected Port {port_num} ({addr} {mode_tag}) [{role}]"
+            ));
         }
 
         tokio::spawn(async move {

@@ -464,6 +464,10 @@ impl eframe::App for SmtGuiApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             // 3A. Selected Port Hardware & Mode Control Toolbar
             let (pa, pb) = adjacent_port_pair(self.selected_port, profile.port_count);
+            let sel_data_port = ports
+                .get((self.selected_port - 1) as usize)
+                .map(|p| p.data_tcp_port())
+                .unwrap_or(949 + u16::from(self.selected_port));
             egui::Frame::none()
                 .fill(Color32::from_rgb(30, 35, 44))
                 .rounding(5.0)
@@ -474,7 +478,7 @@ impl eframe::App for SmtGuiApp {
                             RichText::new(format!(
                                 "Selected: Port {} (Data :{} / ASPP :{}) | Mode: {}",
                                 self.selected_port,
-                                4000 + u16::from(self.selected_port),
+                                sel_data_port,
                                 965 + u16::from(self.selected_port),
                                 mode_banner
                             ))
@@ -925,7 +929,7 @@ impl eframe::App for SmtGuiApp {
 }
 
 fn main() -> eframe::Result<()> {
-    let mut host = String::from("192.168.127.254");
+    let mut host = String::from("192.168.1.249");
     let mut demo = false;
 
     for arg in std::env::args().skip(1) {
