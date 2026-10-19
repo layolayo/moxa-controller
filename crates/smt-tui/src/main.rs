@@ -27,6 +27,7 @@ use ratatui::{Frame, Terminal};
 #[derive(PartialEq, Eq)]
 enum PromptKind {
     None,
+    LiveTerminal,
     InjectFrame,
     AnnotateLog,
     ChangeHostIp,
@@ -36,6 +37,7 @@ enum PromptKind {
 struct AppUiState {
     selected_port: u8,
     prompt_kind: PromptKind,
+    terminal_view: bool,
     input_buffer: String,
     demo_model_idx: usize,
 }
@@ -45,6 +47,7 @@ impl AppUiState {
         Self {
             selected_port: 1,
             prompt_kind: PromptKind::None,
+            terminal_view: true,
             input_buffer: String::new(),
             demo_model_idx: 0,
         }
@@ -64,8 +67,8 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
             Constraint::Length(3),            // Top hardware & model auto-detection banner
             Constraint::Length(table_height), // Dynamic NPort Port Matrix (adapts to 1/2/4/8/16 ports)
             Constraint::Length(5),            // Command, Stream Pause/Stop & Filter Keybinding Bar
-            Constraint::Min(8),               // Live Byte-Diff & Checksum Frame Inspector
-            Constraint::Length(5),            // Event Log / Modal Prompt
+            Constraint::Min(8),               // PuTTY Live Terminal Viewer OR Packet Inspector
+            Constraint::Length(5),            // Event Log / Modal Prompt / PuTTY Typing Status
         ])
         .split(frame.area());
 
@@ -228,10 +231,30 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
     );
     frame.render_widget(ports_table, chunks[1]);
 
-    // 3. Keybinding, Pause/Stop Stream & Filter Control Bar
+    // 3. Keybinding, PuTTY Terminal, Pause/Stop Stream & Filter Control Bar
     let (pa, pb) = adjacent_port_pair(ui.selected_port, st.profile.port_count);
+    let view_mode_label = if ui.terminal_view || ui.prompt_kind == PromptKind::LiveTerminal {
+        "PuTTY Terminal"
+    } else {
+        "Packet Inspector"
+    };
     let controls_text = vec![
         Line::from(vec![
+            Span::styled(
+                "[Enter]",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" PuTTY Live Type (P{})  ", ui.selected_port)),
+            Span::styled(
+                "[Tab]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" View({view_mode_label})  ")),
             Span::styled(
                 "[1-8/↑↓]",
                 Style::default()
@@ -246,18 +269,6 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" Connect  "),
-            Span::styled(
-                "[Space]",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Pause  "),
-            Span::styled(
-                "[s]",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Stop All  "),
             Span::styled(
                 "[b/f/j/e]",
                 Style::default()
@@ -278,9 +289,21 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Inject TX"),
+            Span::raw(" Inject Hex/ASCII"),
         ]),
         Line::from(vec![
+            Span::styled(
+                "[Space]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Pause  "),
+            Span::styled(
+                "[s]",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Stop All  "),
             Span::styled(
                 "[/]",
                 Style::default()
@@ -347,6 +370,13 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
             ),
             Span::raw(" Note  "),
             Span::styled(
+                "[g]",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Clear Screen/Buf  "),
+            Span::styled(
                 "[t/v]",
                 Style::default()
                     .fg(Color::Cyan)
@@ -368,13 +398,6 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
             ),
             Span::raw(" Probe  "),
             Span::styled(
-                "[m]",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Model  "),
-            Span::styled(
                 "[q]",
                 Style::default()
                     .fg(Color::White)
@@ -386,15 +409,52 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
     let controls_block = Paragraph::new(controls_text).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Stream Pause/Stop, Multi-Option Filtering, Sniffing & Logging Controls "),
+            .title(" PuTTY Live Terminal, Stream Pause/Stop, Multi-Option Filtering & Logging Controls "),
     );
     frame.render_widget(controls_block, chunks[2]);
 
-    // 4. Live Framed Packet Inspector with Byte-Diff Highlighting & CRC-16/MODBUS
-    render_frame_inspector(frame, chunks[3], &st);
+    // 4. PuTTY Live Text TX/RX Terminal Viewer OR Framed Packet Inspector
+    if ui.terminal_view || ui.prompt_kind == PromptKind::LiveTerminal {
+        render_terminal_viewer(frame, chunks[3], &st, ui);
+    } else {
+        render_frame_inspector(frame, chunks[3], &st);
+    }
 
     // 5. Event Log or Modal Input Bar
     match ui.prompt_kind {
+        PromptKind::LiveTerminal => {
+            let echo_lbl = if st.terminal_local_echo { "ON" } else { "OFF" };
+            let crlf_lbl = if st.terminal_crlf { "CR+LF (\\r\\n)" } else { "CR (\\r)" };
+            let prompt = Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        format!(" 🟢 LIVE PUTTY TERMINAL TX/RX ACTIVE ON PORT {} ", ui.selected_port),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  Every keystroke transmits live over RS-232!"),
+                ]),
+                Line::from(vec![
+                    Span::styled("[F1]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw(format!(" Local Echo: {echo_lbl}   ")),
+                    Span::styled("[F2]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::raw(format!(" Enter Sends: {crlf_lbl}   ")),
+                    Span::styled("[F3]", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                    Span::raw(" Clear Terminal   "),
+                    Span::styled("[Esc]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::raw(" Exit Live Typing Mode (Return to Hotkeys)"),
+                ]),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green))
+                    .title(" PuTTY Interactive Serial Terminal Mode (Type directly — Esc to exit) "),
+            );
+            frame.render_widget(prompt, chunks[4]);
+        }
         PromptKind::InjectFrame => {
             let prompt = Paragraph::new(format!(
                 "Inject on Port {} (ASCII e.g. \\x0201POLL\\x03 or Hex e.g. hex:02 30 31 03): {}█",
@@ -491,6 +551,103 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
             frame.render_widget(log_block, chunks[4]);
         }
     }
+}
+
+fn render_terminal_viewer(
+    frame: &mut Frame,
+    area: Rect,
+    st: &nport5610_core::SharedEngineState,
+    ui: &AppUiState,
+) {
+    let is_live_typing = ui.prompt_kind == PromptKind::LiveTerminal;
+    let max_rows = area.height.saturating_sub(2) as usize;
+
+    let Some(ps) = st.ports.get((ui.selected_port - 1) as usize) else {
+        return;
+    };
+
+    let alias_str = if ps.alias.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", ps.alias)
+    };
+    let conn_str = if ps.connected { "ONLINE" } else { "DISCONNECTED" };
+    let echo_str = if st.terminal_local_echo { "ON" } else { "OFF" };
+    let crlf_str = if st.terminal_crlf { "CR+LF" } else { "CR" };
+
+    let mut raw_lines: Vec<String> = if ps.terminal_text.is_empty() {
+        vec![String::new()]
+    } else {
+        ps.terminal_text.split('\n').map(String::from).collect()
+    };
+
+    if is_live_typing {
+        if let Some(last) = raw_lines.last_mut() {
+            last.push('█');
+        }
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    if ps.terminal_text.is_empty() && !is_live_typing {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "PuTTY Live Serial Terminal ready on Port {}{} (:{}, {} {} {}).",
+                ps.port_num,
+                alias_str,
+                ps.data_tcp_port(),
+                ps.baud,
+                ps.framing.as_str(),
+                ps.flow_control.as_str()
+            ),
+            Style::default().fg(Color::Cyan),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Press [Enter] to start live PuTTY character-by-character typing (TX/RX), or [Tab] to switch to Packet Inspector.",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        let start = raw_lines.len().saturating_sub(max_rows.max(1));
+        for l in &raw_lines[start..] {
+            lines.push(Line::from(Span::styled(
+                l.clone(),
+                Style::default().fg(Color::Green),
+            )));
+        }
+    }
+
+    let border_col = if is_live_typing {
+        Color::Green
+    } else {
+        Color::Cyan
+    };
+    let mode_hint = if is_live_typing {
+        "🟢 LIVE TYPING ACTIVE (Esc=Exit, F1=Echo, F2=CR+LF, F3=Clear)"
+    } else {
+        "Press [Enter] to Type Live | [Tab] Packet Inspector"
+    };
+    let title = format!(
+        " 🖥 PuTTY Live Terminal — P{}{} [{}] (:{} @ {} {} {}) | Echo:{} Enter:{} | RX:{}B TX:{}B | {} ",
+        ps.port_num,
+        alias_str,
+        conn_str,
+        ps.data_tcp_port(),
+        ps.baud,
+        ps.framing.as_str(),
+        ps.flow_control.as_str(),
+        echo_str,
+        crlf_str,
+        ps.rx_bytes,
+        ps.tx_bytes,
+        mode_hint
+    );
+
+    let block = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_col))
+            .title(title),
+    );
+    frame.render_widget(block, area);
 }
 
 fn render_frame_inspector(
@@ -733,6 +890,59 @@ async fn run_event_loop(
             continue;
         }
 
+        if ui.prompt_kind == PromptKind::LiveTerminal {
+            match key.code {
+                KeyCode::Esc => {
+                    ui.prompt_kind = PromptKind::None;
+                }
+                KeyCode::F(1) => {
+                    let mut st = ctrl.state.lock().unwrap();
+                    st.terminal_local_echo = !st.terminal_local_echo;
+                    let on_off = if st.terminal_local_echo { "ON" } else { "OFF" };
+                    st.log_event(format!("PuTTY Terminal Local Echo -> {on_off}"));
+                }
+                KeyCode::F(2) => {
+                    let mut st = ctrl.state.lock().unwrap();
+                    st.terminal_crlf = !st.terminal_crlf;
+                    let mode = if st.terminal_crlf {
+                        "CR+LF (\\r\\n)"
+                    } else {
+                        "CR (\\r)"
+                    };
+                    st.log_event(format!("PuTTY Terminal Enter line ending -> {mode}"));
+                }
+                KeyCode::F(3) => {
+                    let mut st = ctrl.state.lock().unwrap();
+                    if let Some(ps) = st.ports.get_mut((ui.selected_port - 1) as usize) {
+                        ps.clear_terminal();
+                    }
+                    st.log_event(format!("Cleared Port {} terminal screen", ui.selected_port));
+                }
+                KeyCode::Enter => {
+                    let crlf = { ctrl.state.lock().unwrap().terminal_crlf };
+                    let bytes = if crlf {
+                        b"\r\n".to_vec()
+                    } else {
+                        b"\r".to_vec()
+                    };
+                    ctrl.send_terminal_bytes(ui.selected_port, bytes).await;
+                }
+                KeyCode::Backspace => {
+                    ctrl.send_terminal_bytes(ui.selected_port, vec![0x08]).await;
+                }
+                KeyCode::Tab => {
+                    ctrl.send_terminal_bytes(ui.selected_port, vec![b'\t']).await;
+                }
+                KeyCode::Char(c) => {
+                    let mut buf = [0u8; 4];
+                    let bytes = c.encode_utf8(&mut buf).as_bytes().to_vec();
+                    ctrl.send_terminal_bytes(ui.selected_port, bytes).await;
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         if ui.prompt_kind != PromptKind::None {
             match key.code {
                 KeyCode::Esc => {
@@ -787,6 +997,23 @@ async fn run_event_loop(
         let max_ports = { ctrl.state.lock().unwrap().profile.port_count };
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => break,
+            KeyCode::Tab => {
+                ui.terminal_view = !ui.terminal_view;
+            }
+            KeyCode::Enter => {
+                ui.terminal_view = true;
+                ui.prompt_kind = PromptKind::LiveTerminal;
+                let is_conn = {
+                    let st = ctrl.state.lock().unwrap();
+                    st.ports
+                        .get((ui.selected_port - 1) as usize)
+                        .map(|p| p.connected)
+                        .unwrap_or(false)
+                };
+                if !is_conn {
+                    ctrl.connect_port(ui.selected_port, "TERMINAL").await;
+                }
+            }
             KeyCode::Char(' ') => {
                 ctrl.state.lock().unwrap().toggle_pause();
             }
@@ -859,7 +1086,7 @@ async fn run_event_loop(
                 if is_conn {
                     ctrl.disconnect_port(ui.selected_port);
                 } else {
-                    ctrl.connect_port(ui.selected_port, "STREAM").await;
+                    ctrl.connect_port(ui.selected_port, "TERMINAL").await;
                 }
             }
             KeyCode::Char('b') | KeyCode::Char('B') => {
@@ -954,8 +1181,14 @@ async fn run_event_loop(
             }
             KeyCode::Char('g') | KeyCode::Char('G') => {
                 let mut st = ctrl.state.lock().unwrap();
+                if let Some(ps) = st.ports.get_mut((ui.selected_port - 1) as usize) {
+                    ps.clear_terminal();
+                }
                 st.frames.clear();
-                st.log_event("Cleared frame inspector display buffer");
+                st.log_event(format!(
+                    "Cleared Port {} terminal screen and frame inspector buffer",
+                    ui.selected_port
+                ));
             }
             KeyCode::Char('i') | KeyCode::Char('I') => {
                 ui.prompt_kind = PromptKind::InjectFrame;

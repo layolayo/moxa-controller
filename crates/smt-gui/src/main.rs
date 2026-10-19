@@ -11,11 +11,21 @@ use nport5610_core::{
 
 const DEMO_MODEL_IDS: [u16; 4] = [0x5610, 0x5450, 0x5250, 0x5110];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CenterViewMode {
+    PuttyTerminal,
+    SplitTerminalAndPackets,
+    PacketInspector,
+}
+
 struct SmtGuiApp {
     rt: tokio::runtime::Runtime,
     ctrl: NPortController,
     ip_input: String,
     selected_port: u8,
+    view_mode: CenterViewMode,
+    terminal_live_keystrokes: bool,
+    terminal_line_input: String,
     tx_payload_input: String,
     log_note_input: String,
     min_len_input: String,
@@ -48,6 +58,9 @@ impl SmtGuiApp {
             ctrl,
             ip_input: initial_host,
             selected_port: 1,
+            view_mode: CenterViewMode::SplitTerminalAndPackets,
+            terminal_live_keystrokes: true,
+            terminal_line_input: String::new(),
             tx_payload_input: String::from("\\x0201POLL:99\\x03"),
             log_note_input: String::new(),
             min_len_input: String::new(),
@@ -87,6 +100,8 @@ impl eframe::App for SmtGuiApp {
             mode_banner,
             stream_paused,
             paused_skipped,
+            terminal_local_echo,
+            terminal_crlf,
             filter_snapshot,
             active_log_path,
             ports,
@@ -102,6 +117,8 @@ impl eframe::App for SmtGuiApp {
                 st.mode_banner.clone(),
                 st.stream_paused,
                 st.paused_skipped_frames,
+                st.terminal_local_echo,
+                st.terminal_crlf,
                 st.filter.clone(),
                 st.text_log_path.clone(),
                 st.ports.clone(),
@@ -715,7 +732,7 @@ impl eframe::App for SmtGuiApp {
 
             ui.separator();
 
-            // 3C. Stream Filter Toolbar & Live Serial Frame Inspector
+            // 3C. View Mode Switcher + Stream Filter & Terminal Options Toolbar
             egui::Frame::none()
                 .fill(Color32::from_rgb(26, 31, 40))
                 .rounding(4.0)
@@ -726,7 +743,42 @@ impl eframe::App for SmtGuiApp {
 
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
-                            RichText::new("🔎 Stream Filter:")
+                            RichText::new("🖥 View:")
+                                .color(Color32::from_rgb(0, 220, 255))
+                                .strong(),
+                        );
+                        if ui
+                            .selectable_label(
+                                self.view_mode == CenterViewMode::PuttyTerminal,
+                                "🖥 PuTTY Live Terminal",
+                            )
+                            .clicked()
+                        {
+                            self.view_mode = CenterViewMode::PuttyTerminal;
+                        }
+                        if ui
+                            .selectable_label(
+                                self.view_mode == CenterViewMode::SplitTerminalAndPackets,
+                                "🗔 Split (PuTTY + Packets)",
+                            )
+                            .clicked()
+                        {
+                            self.view_mode = CenterViewMode::SplitTerminalAndPackets;
+                        }
+                        if ui
+                            .selectable_label(
+                                self.view_mode == CenterViewMode::PacketInspector,
+                                "📡 Packet Inspector",
+                            )
+                            .clicked()
+                        {
+                            self.view_mode = CenterViewMode::PacketInspector;
+                        }
+
+                        ui.separator();
+
+                        ui.label(
+                            RichText::new("🔎 Filter:")
                                 .color(Color32::from_rgb(0, 220, 255))
                                 .strong(),
                         );
@@ -734,9 +786,9 @@ impl eframe::App for SmtGuiApp {
                         // Hex / ASCII / Source text search
                         let search_resp = ui.add(
                             egui::TextEdit::singleline(&mut new_filter.search_query)
-                                .desired_width(150.0)
+                                .desired_width(130.0)
                                 .font(FontId::monospace(12.0))
-                                .hint_text("Hex/ASCII e.g. POLL or 02 30"),
+                                .hint_text("Hex/ASCII e.g. POLL"),
                         );
                         if search_resp.changed() {
                             changed = true;
@@ -789,7 +841,7 @@ impl eframe::App for SmtGuiApp {
                         if ui
                             .checkbox(
                                 &mut new_filter.only_changed,
-                                RichText::new("⚡ Changed Bytes Only (Hide Static Heartbeats)")
+                                RichText::new("⚡ Changed Only")
                                     .color(Color32::from_rgb(235, 130, 255)),
                             )
                             .changed()
@@ -803,13 +855,13 @@ impl eframe::App for SmtGuiApp {
                         ui.label(RichText::new("Len(B):").color(Color32::LIGHT_GRAY));
                         let min_resp = ui.add(
                             egui::TextEdit::singleline(&mut self.min_len_input)
-                                .desired_width(36.0)
+                                .desired_width(34.0)
                                 .hint_text("Min"),
                         );
                         ui.label("..");
                         let max_resp = ui.add(
                             egui::TextEdit::singleline(&mut self.max_len_input)
-                                .desired_width(36.0)
+                                .desired_width(34.0)
                                 .hint_text("Max"),
                         );
                         if min_resp.changed() || max_resp.changed() {
@@ -833,130 +885,398 @@ impl eframe::App for SmtGuiApp {
 
             ui.add_space(4.0);
 
-            ui.horizontal(|ui| {
-                let status_badge = if stream_paused {
-                    format!(
-                        "⏸ PAUSED ({paused_skipped} background frames skipped) — Showing {} / {} buffered frames",
-                        filtered_frames.len(),
-                        total_frames
-                    )
-                } else {
-                    format!(
-                        "📡 Live Serial Packet Stream — Showing {} / {} buffered frames (Filter: {})",
-                        filtered_frames.len(),
+            match self.view_mode {
+                CenterViewMode::PuttyTerminal => {
+                    self.render_putty_terminal_pane(
+                        ui,
+                        ctx,
+                        &ports,
+                        terminal_local_echo,
+                        terminal_crlf,
+                    );
+                }
+                CenterViewMode::PacketInspector => {
+                    self.render_packet_inspector_pane(
+                        ui,
+                        stream_paused,
+                        paused_skipped,
+                        &filter_snapshot,
                         total_frames,
-                        filter_snapshot.summary()
-                    )
-                };
-                ui.label(
-                    RichText::new(status_badge)
-                        .color(if stream_paused {
-                            Color32::from_rgb(255, 190, 60)
-                        } else {
-                            Color32::from_rgb(0, 210, 255)
-                        })
-                        .strong(),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.checkbox(&mut self.auto_scroll, "Auto-scroll to latest");
+                        &filtered_frames,
+                    );
+                }
+                CenterViewMode::SplitTerminalAndPackets => {
+                    ui.columns(2, |cols| {
+                        self.render_putty_terminal_pane(
+                            &mut cols[0],
+                            ctx,
+                            &ports,
+                            terminal_local_echo,
+                            terminal_crlf,
+                        );
+                        self.render_packet_inspector_pane(
+                            &mut cols[1],
+                            stream_paused,
+                            paused_skipped,
+                            &filter_snapshot,
+                            total_frames,
+                            &filtered_frames,
+                        );
+                    });
+                }
+            }
+
+            // Capture live character-by-character keystrokes (PuTTY style) when terminal mode is active
+            // and no TextEdit widget currently owns keyboard focus.
+            if self.view_mode != CenterViewMode::PacketInspector
+                && self.terminal_live_keystrokes
+                && !ctx.wants_keyboard_input()
+            {
+                let mut outgoing = Vec::new();
+                let events = ctx.input(|i| i.events.clone());
+                for ev in events {
+                    match ev {
+                        egui::Event::Text(text) => {
+                            if !text.is_empty() {
+                                outgoing.extend_from_slice(text.as_bytes());
+                            }
+                        }
+                        egui::Event::Key {
+                            key: egui::Key::Enter,
+                            pressed: true,
+                            ..
+                        } => {
+                            if terminal_crlf {
+                                outgoing.extend_from_slice(b"\r\n");
+                            } else {
+                                outgoing.push(b'\r');
+                            }
+                        }
+                        egui::Event::Key {
+                            key: egui::Key::Backspace,
+                            pressed: true,
+                            ..
+                        } => {
+                            outgoing.push(0x08);
+                        }
+                        egui::Event::Key {
+                            key: egui::Key::Tab,
+                            pressed: true,
+                            ..
+                        } => {
+                            outgoing.push(b'\t');
+                        }
+                        _ => {}
+                    }
+                }
+                if !outgoing.is_empty() {
+                    let ctrl = self.ctrl.clone();
+                    let p = self.selected_port;
+                    self.rt.spawn(async move {
+                        ctrl.send_terminal_bytes(p, outgoing).await;
+                    });
+                }
+            }
+        });
+    }
+}
+
+impl SmtGuiApp {
+    fn render_putty_terminal_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        ports: &[nport5610_core::PortState],
+        terminal_local_echo: bool,
+        terminal_crlf: bool,
+    ) {
+        let sel_ps = ports.get((self.selected_port - 1) as usize);
+        let is_conn = sel_ps.map(|p| p.connected).unwrap_or(false);
+        let baud = sel_ps.map(|p| p.baud).unwrap_or(9600);
+        let framing = sel_ps.map(|p| p.framing.as_str()).unwrap_or("8N1");
+        let flow = sel_ps.map(|p| p.flow_control.as_str()).unwrap_or("NONE");
+        let data_port = sel_ps
+            .map(|p| p.data_tcp_port())
+            .unwrap_or(949 + u16::from(self.selected_port));
+        let term_text = sel_ps.map(|p| p.terminal_text.as_str()).unwrap_or("");
+        let live_focus = self.terminal_live_keystrokes && !ctx.wants_keyboard_input();
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "🖥 PuTTY Terminal — P{} (:{} @ {} {} {})",
+                    self.selected_port, data_port, baud, framing, flow
+                ))
+                .color(Color32::from_rgb(80, 240, 140))
+                .strong(),
+            );
+
+            ui.checkbox(
+                &mut self.terminal_live_keystrokes,
+                RichText::new("⌨ Live Keystroke TX")
+                    .color(if live_focus {
+                        Color32::LIGHT_GREEN
+                    } else {
+                        Color32::LIGHT_GRAY
+                    }),
+            );
+
+            let mut echo = terminal_local_echo;
+            if ui.checkbox(&mut echo, "Local Echo").changed() {
+                self.ctrl.state.lock().unwrap().terminal_local_echo = echo;
+            }
+
+            let mut crlf = terminal_crlf;
+            if ui.checkbox(&mut crlf, "CR+LF (\\r\\n)").changed() {
+                self.ctrl.state.lock().unwrap().terminal_crlf = crlf;
+            }
+
+            if ui.small_button("🧹 Clear").clicked() {
+                let mut st = self.ctrl.state.lock().unwrap();
+                if let Some(ps) = st.ports.get_mut((self.selected_port - 1) as usize) {
+                    ps.clear_terminal();
+                }
+            }
+
+            if ui.small_button("📋 Copy").clicked() {
+                ui.output_mut(|o| o.copied_text = term_text.to_string());
+            }
+        });
+
+        // Line command bar for sending complete lines or commands
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Line TX:")
+                    .color(Color32::from_rgb(0, 210, 255))
+                    .monospace(),
+            );
+            let line_resp = ui.add(
+                egui::TextEdit::singleline(&mut self.terminal_line_input)
+                    .desired_width(220.0)
+                    .font(FontId::monospace(12.5))
+                    .hint_text("Type command line & press Enter (or click screen below for live keystrokes)"),
+            );
+            let send_clicked = ui.button("⏎ Send Line").clicked()
+                || (line_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if send_clicked {
+                let mut bytes = self.terminal_line_input.as_bytes().to_vec();
+                if terminal_crlf {
+                    bytes.extend_from_slice(b"\r\n");
+                } else {
+                    bytes.push(b'\r');
+                }
+                self.terminal_line_input.clear();
+                let ctrl = self.ctrl.clone();
+                let p = self.selected_port;
+                self.rt.spawn(async move {
+                    ctrl.send_terminal_bytes(p, bytes).await;
                 });
+            }
+            if !live_focus && ui.small_button("🟢 Focus Live Keyboard").clicked() {
+                if let Some(focused_id) = ctx.memory(|m| m.focused()) {
+                    ctx.memory_mut(|m| m.surrender_focus(focused_id));
+                }
+                self.terminal_live_keystrokes = true;
+            }
+        });
+
+        let border_col = if live_focus {
+            Color32::from_rgb(60, 230, 120)
+        } else {
+            Color32::from_rgb(60, 75, 95)
+        };
+
+        let term_frame = egui::Frame::none()
+            .fill(Color32::from_rgb(10, 14, 18))
+            .stroke(Stroke::new(if live_focus { 1.5_f32 } else { 1.0_f32 }, border_col))
+            .rounding(4.0)
+            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.set_min_height(ui.available_height().max(120.0));
+                ScrollArea::vertical()
+                    .id_salt("putty_terminal_scroll")
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        if term_text.is_empty() {
+                            let status_msg = if is_conn {
+                                format!(
+                                    "Connected to Port {} (:{} @ {} {} {}).\nClick inside this terminal and type — every keystroke is transmitted live (like PuTTY).",
+                                    self.selected_port, data_port, baud, framing, flow
+                                )
+                            } else {
+                                format!(
+                                    "Port {} (:{} @ {} {} {}) ready.\nClick inside this terminal and type to auto-connect & transmit live (like PuTTY).",
+                                    self.selected_port, data_port, baud, framing, flow
+                                )
+                            };
+                            ui.label(
+                                RichText::new(if live_focus {
+                                    format!("{status_msg}\n█")
+                                } else {
+                                    status_msg
+                                })
+                                .color(Color32::from_rgb(110, 210, 140))
+                                .monospace()
+                                .size(13.0),
+                            );
+                        } else {
+                            let display_str = if live_focus {
+                                format!("{term_text}█")
+                            } else {
+                                term_text.to_string()
+                            };
+                            ui.label(
+                                RichText::new(display_str)
+                                    .color(Color32::from_rgb(90, 245, 130))
+                                    .monospace()
+                                    .size(13.0),
+                            );
+                        }
+                    });
             });
 
-            ScrollArea::vertical()
-                .id_salt("packet_inspector_scroll")
-                .stick_to_bottom(self.auto_scroll)
-                .show(ui, |ui| {
-                    for fr in &filtered_frames {
-                        let is_selected_frame = self.selected_frame_seq == Some(fr.seq);
-                        let dir_col = if fr.direction.contains("CTRL→DEV")
-                            || fr.direction.starts_with("P1")
-                        {
-                            Color32::from_rgb(80, 220, 255)
-                        } else if fr.direction.contains("DEV→CTRL")
-                            || fr.direction.starts_with("P2")
-                        {
-                            Color32::from_rgb(255, 210, 90)
-                        } else if fr.direction.contains("TX") {
-                            Color32::from_rgb(235, 130, 255)
-                        } else {
-                            Color32::LIGHT_GREEN
-                        };
+        if term_frame.response.interact(egui::Sense::click()).clicked() {
+            if let Some(focused_id) = ctx.memory(|m| m.focused()) {
+                ctx.memory_mut(|m| m.surrender_focus(focused_id));
+            }
+            self.terminal_live_keystrokes = true;
+        }
+    }
 
-                        let row_bg = if is_selected_frame {
-                            Color32::from_rgb(45, 55, 75)
-                        } else {
-                            Color32::TRANSPARENT
-                        };
-
-                        let resp = egui::Frame::none()
-                            .fill(row_bg)
-                            .inner_margin(egui::Margin::symmetric(4.0, 2.0))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "#{:<4} {} +{:>7.2}ms {:<14} ({:>2}B) |",
-                                            fr.seq,
-                                            fr.timestamp.format("%H:%M:%S%.3f"),
-                                            fr.delta_ms,
-                                            fr.direction,
-                                            fr.payload.len()
-                                        ))
-                                        .color(dir_col)
-                                        .monospace()
-                                        .size(12.0),
-                                    );
-
-                                    // Render hex bytes with Magenta highlight on changed bytes
-                                    for (idx, &b) in fr.payload.iter().take(16).enumerate() {
-                                        let changed = fr.changed_indices.contains(&idx);
-                                        if changed {
-                                            egui::Frame::none()
-                                                .fill(Color32::from_rgb(175, 35, 195))
-                                                .rounding(2.0)
-                                                .inner_margin(egui::Margin::symmetric(2.0, 0.0))
-                                                .show(ui, |ui| {
-                                                    ui.label(
-                                                        RichText::new(format!("{b:02X}"))
-                                                            .color(Color32::WHITE)
-                                                            .monospace()
-                                                            .strong()
-                                                            .size(12.0),
-                                                    );
-                                                });
-                                        } else {
-                                            ui.label(
-                                                RichText::new(format!("{b:02X}"))
-                                                    .color(dir_col)
-                                                    .monospace()
-                                                    .size(12.0),
-                                            );
-                                        }
-                                    }
-
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "| {:<18} | XOR:{:02X} LRC:{:02X} CRC16:{:04X}",
-                                            fr.ascii_string(),
-                                            fr.checksums.xor8,
-                                            fr.checksums.lrc,
-                                            fr.checksums.crc16_modbus
-                                        ))
-                                        .color(Color32::LIGHT_GRAY)
-                                        .monospace()
-                                        .size(12.0),
-                                    );
-                                });
-                            })
-                            .response;
-
-                        if resp.interact(egui::Sense::click()).clicked() {
-                            self.selected_frame_seq = Some(fr.seq);
-                            self.auto_scroll = false;
-                        }
-                    }
-                });
+    fn render_packet_inspector_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        stream_paused: bool,
+        paused_skipped: u64,
+        filter_snapshot: &FrameFilter,
+        total_frames: usize,
+        filtered_frames: &[SerialFrame],
+    ) {
+        ui.horizontal(|ui| {
+            let status_badge = if stream_paused {
+                format!(
+                    "⏸ PAUSED ({paused_skipped} skipped) — {}/{} frames",
+                    filtered_frames.len(),
+                    total_frames
+                )
+            } else {
+                format!(
+                    "📡 Packet Stream — {}/{} frames ({})",
+                    filtered_frames.len(),
+                    total_frames,
+                    filter_snapshot.summary()
+                )
+            };
+            ui.label(
+                RichText::new(status_badge)
+                    .color(if stream_paused {
+                        Color32::from_rgb(255, 190, 60)
+                    } else {
+                        Color32::from_rgb(0, 210, 255)
+                    })
+                    .strong(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.checkbox(&mut self.auto_scroll, "Auto-scroll");
+            });
         });
+
+        ScrollArea::vertical()
+            .id_salt("packet_inspector_scroll")
+            .stick_to_bottom(self.auto_scroll)
+            .show(ui, |ui| {
+                for fr in filtered_frames {
+                    let is_selected_frame = self.selected_frame_seq == Some(fr.seq);
+                    let dir_col = if fr.direction.contains("CTRL→DEV")
+                        || fr.direction.starts_with("P1")
+                    {
+                        Color32::from_rgb(80, 220, 255)
+                    } else if fr.direction.contains("DEV→CTRL")
+                        || fr.direction.starts_with("P2")
+                    {
+                        Color32::from_rgb(255, 210, 90)
+                    } else if fr.direction.contains("TX") {
+                        Color32::from_rgb(235, 130, 255)
+                    } else {
+                        Color32::LIGHT_GREEN
+                    };
+
+                    let row_bg = if is_selected_frame {
+                        Color32::from_rgb(45, 55, 75)
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+
+                    let resp = egui::Frame::none()
+                        .fill(row_bg)
+                        .inner_margin(egui::Margin::symmetric(4.0, 2.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "#{:<4} {} +{:>7.2}ms {:<14} ({:>2}B) |",
+                                        fr.seq,
+                                        fr.timestamp.format("%H:%M:%S%.3f"),
+                                        fr.delta_ms,
+                                        fr.direction,
+                                        fr.payload.len()
+                                    ))
+                                    .color(dir_col)
+                                    .monospace()
+                                    .size(12.0),
+                                );
+
+                                // Render hex bytes with Magenta highlight on changed bytes
+                                for (idx, &b) in fr.payload.iter().take(16).enumerate() {
+                                    let changed = fr.changed_indices.contains(&idx);
+                                    if changed {
+                                        egui::Frame::none()
+                                            .fill(Color32::from_rgb(175, 35, 195))
+                                            .rounding(2.0)
+                                            .inner_margin(egui::Margin::symmetric(2.0, 0.0))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    RichText::new(format!("{b:02X}"))
+                                                        .color(Color32::WHITE)
+                                                        .monospace()
+                                                        .strong()
+                                                        .size(12.0),
+                                                );
+                                            });
+                                    } else {
+                                        ui.label(
+                                            RichText::new(format!("{b:02X}"))
+                                                .color(dir_col)
+                                                .monospace()
+                                                .size(12.0),
+                                        );
+                                    }
+                                }
+
+                                ui.label(
+                                    RichText::new(format!(
+                                        "| {:<18} | XOR:{:02X} LRC:{:02X} CRC16:{:04X}",
+                                        fr.ascii_string(),
+                                        fr.checksums.xor8,
+                                        fr.checksums.lrc,
+                                        fr.checksums.crc16_modbus
+                                    ))
+                                    .color(Color32::LIGHT_GRAY)
+                                    .monospace()
+                                    .size(12.0),
+                                );
+                            });
+                        })
+                        .response;
+
+                    if resp.interact(egui::Sense::click()).clicked() {
+                        self.selected_frame_seq = Some(fr.seq);
+                        self.auto_scroll = false;
+                    }
+                }
+            });
     }
 }
 

@@ -1028,6 +1028,8 @@ pub struct PortState {
     pub tx_bytes: u64,
     pub rx_frames: u64,
     pub tx_frames: u64,
+    pub terminal_text: String,
+    pub last_was_cr: bool,
 }
 
 impl PortState {
@@ -1052,6 +1054,8 @@ impl PortState {
             tx_bytes: 0,
             rx_frames: 0,
             tx_frames: 0,
+            terminal_text: String::new(),
+            last_was_cr: false,
         }
     }
 
@@ -1061,6 +1065,57 @@ impl PortState {
 
     pub fn aspp_tcp_port(&self) -> u16 {
         965 + u16::from(self.port_num)
+    }
+
+    /// Append raw serial RX or local-echoed TX bytes into the PuTTY-style live terminal buffer.
+    pub fn append_terminal_bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            match b {
+                b'\r' => {
+                    self.terminal_text.push('\n');
+                    self.last_was_cr = true;
+                }
+                b'\n' => {
+                    if !self.last_was_cr {
+                        self.terminal_text.push('\n');
+                    }
+                    self.last_was_cr = false;
+                }
+                0x08 | 0x7F => {
+                    // Backspace / DEL removes the last character on the current line
+                    if !self.terminal_text.ends_with('\n') {
+                        self.terminal_text.pop();
+                    }
+                    self.last_was_cr = false;
+                }
+                b'\t' => {
+                    self.terminal_text.push_str("    ");
+                    self.last_was_cr = false;
+                }
+                0x20..=0x7E => {
+                    self.terminal_text.push(b as char);
+                    self.last_was_cr = false;
+                }
+                other => {
+                    self.terminal_text.push_str(&format!("<{other:02X}>"));
+                    self.last_was_cr = false;
+                }
+            }
+        }
+        // Keep a rolling 16 KB terminal history
+        if self.terminal_text.len() > 16384 {
+            let drain_to = self.terminal_text.len() - 12288;
+            if let Some(pos) = self.terminal_text[drain_to..].find('\n') {
+                self.terminal_text.drain(..drain_to + pos + 1);
+            } else {
+                self.terminal_text.drain(..drain_to);
+            }
+        }
+    }
+
+    pub fn clear_terminal(&mut self) {
+        self.terminal_text.clear();
+        self.last_was_cr = false;
     }
 }
 
@@ -1273,6 +1328,8 @@ pub struct SharedEngineState {
     pub simulate: bool,
     pub stream_paused: bool,
     pub paused_skipped_frames: u64,
+    pub terminal_local_echo: bool,
+    pub terminal_crlf: bool,
     pub filter: FrameFilter,
     pub mode_banner: String,
     pub ports: Vec<PortState>,
@@ -1329,6 +1386,8 @@ impl SharedEngineState {
             simulate,
             stream_paused: false,
             paused_skipped_frames: 0,
+            terminal_local_echo: true,
+            terminal_crlf: true,
             filter: FrameFilter::default(),
             mode_banner: if simulate {
                 String::from("PASSIVE TAP (P1 + P2) [DEMO]")
@@ -1663,8 +1722,13 @@ impl NPortController {
                 req.push(xor_req);
                 {
                     let mut st = state_arc.lock().unwrap();
+                    let paused = st.stream_paused;
                     st.ports[0].rx_bytes += req.len() as u64;
                     st.ports[0].rx_frames += 1;
+                    if !paused {
+                        st.ports[0].append_terminal_bytes(&req);
+                        st.ports[0].append_terminal_bytes(b"\r\n");
+                    }
                     let label = if p1_role.contains("MITM") {
                         "P1 MITM→P2"
                     } else {
@@ -1681,8 +1745,13 @@ impl NPortController {
                 resp.push(xor_resp);
                 {
                     let mut st = state_arc.lock().unwrap();
+                    let paused = st.stream_paused;
                     st.ports[1].rx_bytes += resp.len() as u64;
                     st.ports[1].rx_frames += 1;
+                    if !paused {
+                        st.ports[1].append_terminal_bytes(&resp);
+                        st.ports[1].append_terminal_bytes(b"\r\n");
+                    }
                     let label = if p2_role.contains("MITM") {
                         "P2 MITM→P1"
                     } else {
@@ -2274,7 +2343,7 @@ impl NPortController {
 
     pub async fn connect_port(&self, port_num: u8, role: impl Into<String>) -> bool {
         let role = role.into();
-        let (host, gap_ms, baud, framing, dtr, rts) = {
+        let (host, gap_ms, baud, framing, dtr, rts, flow) = {
             let mut st = self.state.lock().unwrap();
             if st.simulate {
                 if let Some(ps) = st.ports.get_mut((port_num - 1) as usize) {
@@ -2284,28 +2353,23 @@ impl NPortController {
                 st.log_event(format!("Connected Port {port_num} in {role} mode [DEMO]"));
                 return true;
             }
-            let (baud, framing, dtr, rts) = st
+            // Clear any stale command channel so we establish Data first, Command second
+            st.cmd_senders.remove(&port_num);
+            let (baud, framing, dtr, rts, flow) = st
                 .ports
                 .get((port_num - 1) as usize)
-                .map(|p| (p.baud, p.framing, p.dtr, p.rts))
-                .unwrap_or((9600, UartFraming::F8N1, true, true));
-            (st.host.clone(), st.gap_ms, baud, framing, dtr, rts)
+                .map(|p| (p.baud, p.framing, p.dtr, p.rts, p.flow_control))
+                .unwrap_or((9600, UartFraming::F8N1, true, true, FlowControl::None));
+            (st.host.clone(), st.gap_ms, baud, framing, dtr, rts, flow)
         };
 
-        // Open and hold the persistent ASPP Command socket (:966..973) FIRST so RealCOM UART config stays locked
-        if let Ok(cmd_tx) = self.ensure_aspp_cmd_channel(port_num).await {
-            let mut payload = aspp_codec::encode_port_init(baud, framing, dtr, rts).to_vec();
-            payload.extend_from_slice(&aspp_codec::encode_exact_baud(baud));
-            let _ = cmd_tx.send(payload);
-        }
-
-        // Try TCP Server Mode (:4001..4016) first, then automatically fall back to Real COM Mode (:950..965)
+        // 1. Open Data socket FIRST (:4001..4016 TCP Server Mode, falling back to :950..965 RealCOM Mode)
         let tcp_srv_port = 4000 + u16::from(port_num);
         let realcom_port = 949 + u16::from(port_num);
         let mut chosen_port = tcp_srv_port;
 
         let stream = match tokio::time::timeout(
-            Duration::from_millis(500),
+            Duration::from_millis(400),
             TcpStream::connect(format!("{host}:{tcp_srv_port}")),
         )
         .await
@@ -2315,7 +2379,7 @@ impl NPortController {
                 chosen_port = realcom_port;
                 let addr = format!("{host}:{realcom_port}");
                 match tokio::time::timeout(
-                    Duration::from_millis(900),
+                    Duration::from_millis(800),
                     TcpStream::connect(&addr),
                 )
                 .await
@@ -2337,10 +2401,11 @@ impl NPortController {
             }
         };
 
-        // Re-assert UART baud & framing after Data socket connects so the NPort 5610 applies our exact baud rate
+        // 2. Open persistent ASPP Command socket (:966..973) SECOND and apply UART baud, framing & flow control
         if let Ok(cmd_tx) = self.ensure_aspp_cmd_channel(port_num).await {
-            let mut payload = aspp_codec::encode_port_init(baud, framing, dtr, rts).to_vec();
-            payload.extend_from_slice(&aspp_codec::encode_exact_baud(baud));
+            let mut payload =
+                aspp_codec::encode_port_init_with_flow(baud, framing, dtr, rts, flow).to_vec();
+            payload.extend_from_slice(&aspp_codec::encode_flowctrl(flow));
             let _ = cmd_tx.send(payload);
         }
 
@@ -2374,6 +2439,7 @@ impl NPortController {
                 if writer.write_all(&pkt).await.is_err() {
                     break;
                 }
+                let _ = writer.flush().await;
             }
         });
 
@@ -2403,8 +2469,12 @@ impl NPortController {
                         let slice = &chunk[..n];
                         buf.extend_from_slice(slice);
                         let mut st = state_arc.lock().unwrap();
+                        let paused = st.stream_paused;
                         if let Some(ps) = st.ports.get_mut((port_num - 1) as usize) {
                             ps.rx_bytes += n as u64;
+                            if !paused {
+                                ps.append_terminal_bytes(slice);
+                            }
                         }
                         if let Some(&peer) = st.mitm_peer.get(&port_num) {
                             if let Some(peer_tx) = st.tx_senders.get(&peer) {
@@ -2546,9 +2616,13 @@ impl NPortController {
                 let _ = tx.send(payload.clone());
             }
         }
+        let local_echo = st.terminal_local_echo;
         if let Some(ps) = st.ports.get_mut((port_num - 1) as usize) {
             ps.tx_bytes += payload.len() as u64;
             ps.tx_frames += 1;
+            if local_echo {
+                ps.append_terminal_bytes(&payload);
+            }
         }
         st.record_frame(port_num, format!("P{port_num} TX→LINE"), payload.clone());
 
@@ -2561,6 +2635,52 @@ impl NPortController {
             if let Some(ps) = st.ports.get_mut((port_num - 1) as usize) {
                 ps.rx_bytes += reply.len() as u64;
                 ps.rx_frames += 1;
+                ps.append_terminal_bytes(&reply);
+            }
+            st.record_frame(port_num, format!("P{port_num} RX←DEV"), reply);
+        }
+    }
+
+    /// Transmit live PuTTY-style terminal bytes (single keystrokes or lines) on `port_num`.
+    /// Automatically opens the port stream if not already connected.
+    pub async fn send_terminal_bytes(&self, port_num: u8, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let is_connected = {
+            let st = self.state.lock().unwrap();
+            st.ports
+                .get((port_num - 1) as usize)
+                .map(|p| p.connected)
+                .unwrap_or(false)
+        };
+        if !is_connected && !self.connect_port(port_num, "TERMINAL").await {
+            return;
+        }
+
+        let mut st = self.state.lock().unwrap();
+        if !st.simulate {
+            if let Some(tx) = st.tx_senders.get(&port_num) {
+                let _ = tx.send(bytes.clone());
+            }
+        }
+        let local_echo = st.terminal_local_echo;
+        if let Some(ps) = st.ports.get_mut((port_num - 1) as usize) {
+            ps.tx_bytes += bytes.len() as u64;
+            ps.tx_frames += 1;
+            if local_echo {
+                ps.append_terminal_bytes(&bytes);
+            }
+        }
+        let sent_newline = bytes.contains(&b'\r') || bytes.contains(&b'\n');
+        st.record_frame(port_num, format!("P{port_num} TX→LINE"), bytes);
+
+        if st.simulate && sent_newline {
+            let reply = b"OK\r\n".to_vec();
+            if let Some(ps) = st.ports.get_mut((port_num - 1) as usize) {
+                ps.rx_bytes += reply.len() as u64;
+                ps.rx_frames += 1;
+                ps.append_terminal_bytes(&reply);
             }
             st.record_frame(port_num, format!("P{port_num} RX←DEV"), reply);
         }
@@ -2689,5 +2809,26 @@ mod tests {
         st.filter.reset();
         st.filter.search_query = String::from("248C");
         assert_eq!(st.filtered_frames().len(), 1);
+    }
+
+    #[test]
+    fn test_putty_terminal_text_and_crlf_handling() {
+        let mut ps = PortState::new(1);
+        // CR+LF across separate chunks should produce a single newline
+        ps.append_terminal_bytes(b"AT+GMR\r");
+        ps.append_terminal_bytes(b"\nOK\r\n");
+        assert_eq!(ps.terminal_text, "AT+GMR\nOK\n");
+
+        // Backspace (0x08) and DEL (0x7F) edit the active line without deleting past newline
+        ps.append_terminal_bytes(b"HELX\x08LO!\x7F");
+        assert_eq!(ps.terminal_text, "AT+GMR\nOK\nHELLO");
+
+        // Non-printable control bytes render as <XX>
+        ps.append_terminal_bytes(&[0x02, b'A', 0x03]);
+        assert_eq!(ps.terminal_text, "AT+GMR\nOK\nHELLO<02>A<03>");
+
+        ps.clear_terminal();
+        assert!(ps.terminal_text.is_empty());
+        assert!(!ps.last_was_cr);
     }
 }
