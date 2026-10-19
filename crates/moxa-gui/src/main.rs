@@ -163,10 +163,20 @@ impl eframe::App for SmtGuiApp {
         // -------------------------------------------------------------------
         // 1. Top Panel: Moxa IP Connection, Model Auto-Detection & Logging
         // -------------------------------------------------------------------
+        // On Wayland/Hyprland, a fullscreen window covers y=0..960 visually over the 26px
+        // WlrLayer.Top status bar (`omarchy-bar` at y=0..26), but the compositor layer surface
+        // still intercepts pointer clicks in y=0..26. Applying a 30px top safe-area margin
+        // when fullscreen ensures all GUI topbar controls sit below y=26 and receive mouse clicks.
+        let covers_top_bar = self.is_fullscreen || ctx.screen_rect().height() >= 945.0;
+        let top_safe_margin = if covers_top_bar { 30.0 } else { 6.0 };
         egui::TopBottomPanel::top("top_connection_bar")
             .frame(
-                egui::Frame::side_top_panel(&ctx.style())
-                    .inner_margin(egui::Margin::symmetric(10.0, 6.0)),
+                egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
+                    left: 10.0,
+                    right: 10.0,
+                    top: top_safe_margin,
+                    bottom: 6.0,
+                }),
             )
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
