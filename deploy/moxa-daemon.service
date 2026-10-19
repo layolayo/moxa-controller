@@ -1,11 +1,11 @@
 [Unit]
-Description=SMT Control System — Moxa NPort Adaptive Serial Daemon & IPC Service
+Description=Moxa Controller — Moxa NPort Adaptive Serial Daemon & IPC Service
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/smt-daemon 192.168.127.254 --ipc 127.0.0.1:7450
+ExecStart=/usr/local/bin/moxa-daemon 192.168.1.249 --ipc 127.0.0.1:7450
 Restart=always
 RestartSec=2
 NoNewPrivileges=true

@@ -1,5 +1,5 @@
-//! `smt-gui` — Native Wayland/X11 Desktop GUI for Moxa NPort Connection,
-//! Configuration, On-Demand Logging, and RS-232 Protocol Reverse-Engineering.
+//! `moxa-gui` (`smt-gui`) — Native Wayland/X11 Desktop GUI for Moxa NPort Connection,
+//! Configuration, On-Demand Logging, and RS-232/422/485 Protocol Reverse-Engineering.
 
 use std::time::Duration;
 
@@ -34,10 +34,18 @@ struct SmtGuiApp {
     discovered_units: Vec<DiscoveredNPort>,
     demo_model_idx: usize,
     auto_scroll: bool,
+    is_fullscreen: bool,
+    show_port_matrix: bool,
+    show_bottom_dissector: bool,
 }
 
 impl SmtGuiApp {
-    fn new(cc: &eframe::CreationContext<'_>, initial_host: String, demo: bool) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        initial_host: String,
+        demo: bool,
+        start_fullscreen: bool,
+    ) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -69,6 +77,9 @@ impl SmtGuiApp {
             discovered_units: Vec::new(),
             demo_model_idx: 0,
             auto_scroll: true,
+            is_fullscreen: start_fullscreen,
+            show_port_matrix: true,
+            show_bottom_dissector: true,
         }
     }
 }
@@ -92,6 +103,17 @@ impl eframe::App for SmtGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Repaint at ~20 Hz so live serial traffic updates smoothly
         ctx.request_repaint_after(Duration::from_millis(50));
+
+        // Sync fullscreen state with the Wayland/X11 viewport if reported by the compositor
+        if let Some(vp_fs) = ctx.input(|i| i.viewport().fullscreen) {
+            self.is_fullscreen = vp_fs;
+        }
+
+        // Toggle fullscreen via F11 shortcut
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.is_fullscreen = !self.is_fullscreen;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
+        }
 
         // Record whether any TextEdit widget owned keyboard focus at the start of this frame
         // so that pressing Enter inside a single-line TextEdit (which surrenders focus during ui.add)
@@ -141,186 +163,220 @@ impl eframe::App for SmtGuiApp {
         // -------------------------------------------------------------------
         // 1. Top Panel: Moxa IP Connection, Model Auto-Detection & Logging
         // -------------------------------------------------------------------
-        egui::TopBottomPanel::top("top_connection_bar").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(0, 180, 216))
-                    .rounding(4.0)
-                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} ({}-Port {})",
-                                profile.model_name, profile.port_count, profile.interfaces
-                            ))
-                            .color(Color32::BLACK)
-                            .strong(),
-                        );
-                    });
+        egui::TopBottomPanel::top("top_connection_bar")
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(10.0, 6.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(0, 180, 216))
+                        .rounding(4.0)
+                        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} ({}-Port {})",
+                                    profile.model_name, profile.port_count, profile.interfaces
+                                ))
+                                .color(Color32::BLACK)
+                                .strong(),
+                            );
+                        });
 
-                ui.label(
-                    RichText::new(format!("Connector: {} | Via: {}", profile.connector, discovery_method))
+                    ui.label(
+                        RichText::new(format!(
+                            "Connector: {} | Via: {}",
+                            profile.connector, discovery_method
+                        ))
                         .color(Color32::LIGHT_GRAY),
-                );
+                    );
 
-                ui.separator();
+                    ui.separator();
 
-                ui.label(RichText::new("Moxa IP:").strong());
-                let ip_resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.ip_input)
-                        .desired_width(135.0)
-                        .font(FontId::monospace(13.0)),
-                );
-                let ip_enter = ip_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.button("🔌 Connect & Auto-Detect").clicked() || ip_enter {
-                    if ip_enter {
-                        text_edit_submitted = true;
+                    ui.label(RichText::new("Moxa IP:").strong());
+                    let ip_resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.ip_input)
+                            .desired_width(135.0)
+                            .font(FontId::monospace(13.0)),
+                    );
+                    let ip_enter =
+                        ip_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("🔌 Connect & Auto-Detect").clicked() || ip_enter {
+                        if ip_enter {
+                            text_edit_submitted = true;
+                        }
+                        let new_ip = self.ip_input.trim().to_string();
+                        let ctrl = self.ctrl.clone();
+                        self.rt.spawn(async move {
+                            ctrl.switch_target_host(new_ip).await;
+                        });
                     }
-                    let new_ip = self.ip_input.trim().to_string();
-                    let ctrl = self.ctrl.clone();
-                    self.rt.spawn(async move {
-                        ctrl.switch_target_host(new_ip).await;
-                    });
-                }
 
-                if ui.button("📡 UDP 4800 LAN Scan").clicked() {
-                    let ctrl = self.ctrl.clone();
-                    if let Ok(found) = self
-                        .rt
-                        .block_on(discover_nports_udp(Duration::from_millis(750)))
+                    if ui.button("📡 UDP 4800 LAN Scan").clicked() {
+                        let ctrl = self.ctrl.clone();
+                        if let Ok(found) = self
+                            .rt
+                            .block_on(discover_nports_udp(Duration::from_millis(750)))
+                        {
+                            let mut st = ctrl.state.lock().unwrap();
+                            if found.is_empty() {
+                                st.log_event(
+                                    "UDP 4800 scan finished: no remote NPort units responded on LAN",
+                                );
+                            } else {
+                                for u in &found {
+                                    st.log_event(format!(
+                                        "Discovered {} at {} [{}]",
+                                        u.profile.model_name, u.ip_address, u.mac_address
+                                    ));
+                                }
+                            }
+                            self.discovered_units = found;
+                        }
+                    }
+
+                    if ui.button("🔄 Cycle Demo Model").clicked() {
+                        self.demo_model_idx = (self.demo_model_idx + 1) % DEMO_MODEL_IDS.len();
+                        let next_id = DEMO_MODEL_IDS[self.demo_model_idx];
+                        let new_prof = NPortModelProfile::from_model_id(next_id);
+                        let mut st = self.ctrl.state.lock().unwrap();
+                        let cur_host = st.host.clone();
+                        st.apply_detected_profile(DiscoveredNPort {
+                            ip_address: cur_host,
+                            mac_address: String::from("00:90:E8:56:10:08"),
+                            profile: new_prof,
+                            discovery_method: String::from("Simulated Model Switch"),
+                        });
+                    }
+
+                    ui.separator();
+
+                    // Stream Pause / Resume & Stop All Streams Controls
+                    let pause_btn_text = if stream_paused {
+                        RichText::new(format!("▶ Resume Stream ({paused_skipped} skipped)"))
+                            .color(Color32::BLACK)
+                            .strong()
+                    } else {
+                        RichText::new("⏸ Pause Stream").color(Color32::WHITE)
+                    };
+                    let pause_btn = egui::Button::new(pause_btn_text).fill(if stream_paused {
+                        Color32::from_rgb(245, 175, 40)
+                    } else {
+                        Color32::from_rgb(55, 65, 81)
+                    });
+                    if ui.add(pause_btn).clicked() {
+                        self.ctrl.state.lock().unwrap().toggle_pause();
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("⏹ Stop All Streams")
+                                    .color(Color32::from_rgb(255, 140, 140)),
+                            )
+                            .fill(Color32::from_rgb(65, 35, 40)),
+                        )
+                        .clicked()
                     {
-                        let mut st = ctrl.state.lock().unwrap();
-                        if found.is_empty() {
-                            st.log_event("UDP 4800 scan finished: no remote NPort units responded on LAN");
-                        } else {
-                            for u in &found {
-                                st.log_event(format!(
-                                    "Discovered {} at {} [{}]",
-                                    u.profile.model_name, u.ip_address, u.mac_address
-                                ));
+                        self.ctrl.stop_all_streams();
+                    }
+
+                    ui.separator();
+
+                    // On-Demand Stream Logging & Buffer Dump Buttons
+                    let is_logging = active_log_path.is_some();
+                    let log_btn_text = if let Some(ref p) = active_log_path {
+                        RichText::new(format!("● REC: {}", p.display()))
+                            .color(Color32::WHITE)
+                            .strong()
+                    } else {
+                        RichText::new("⏺ Start Live Log").color(Color32::WHITE)
+                    };
+                    let log_btn = egui::Button::new(log_btn_text).fill(if is_logging {
+                        Color32::from_rgb(200, 40, 40)
+                    } else {
+                        Color32::from_rgb(55, 65, 81)
+                    });
+                    if ui.add(log_btn).clicked() {
+                        self.ctrl.state.lock().unwrap().toggle_jsonl(None);
+                    }
+
+                    if ui
+                        .button(
+                            RichText::new("⬇ Dump Buffer to Log Now")
+                                .color(Color32::from_rgb(120, 240, 160)),
+                        )
+                        .clicked()
+                    {
+                        self.ctrl.state.lock().unwrap().dump_buffer_on_demand(None);
+                    }
+
+                    if ui.button("🗑 Clear Buffer").clicked() {
+                        let mut st = self.ctrl.state.lock().unwrap();
+                        st.frames.clear();
+                        self.selected_frame_seq = None;
+                        st.log_event("Cleared packet inspector display buffer");
+                    }
+
+                    ui.separator();
+
+                    let matrix_lbl = if self.show_port_matrix {
+                        "🔼 Hide Port Matrix"
+                    } else {
+                        "🔽 Show Port Matrix"
+                    };
+                    if ui.button(matrix_lbl).clicked() {
+                        self.show_port_matrix = !self.show_port_matrix;
+                    }
+
+                    let fs_lbl = if self.is_fullscreen {
+                        "🗗 Exit Fullscreen (F11)"
+                    } else {
+                        "⛶ Fullscreen (F11)"
+                    };
+                    if ui.button(fs_lbl).clicked() {
+                        self.is_fullscreen = !self.is_fullscreen;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
+                            self.is_fullscreen,
+                        ));
+                    }
+                });
+
+                if !self.discovered_units.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Discovered on LAN:").color(Color32::YELLOW));
+                        for u in self.discovered_units.clone() {
+                            if ui
+                                .small_button(format!(
+                                    "{} ({}) [{}]",
+                                    u.ip_address, u.profile.model_name, u.mac_address
+                                ))
+                                .clicked()
+                            {
+                                self.ip_input = u.ip_address.clone();
+                                let ctrl = self.ctrl.clone();
+                                self.rt.spawn(async move {
+                                    ctrl.switch_target_host(u.ip_address).await;
+                                });
                             }
                         }
-                        self.discovered_units = found;
-                    }
-                }
-
-                if ui.button("🔄 Cycle Demo Model").clicked() {
-                    self.demo_model_idx = (self.demo_model_idx + 1) % DEMO_MODEL_IDS.len();
-                    let next_id = DEMO_MODEL_IDS[self.demo_model_idx];
-                    let new_prof = NPortModelProfile::from_model_id(next_id);
-                    let mut st = self.ctrl.state.lock().unwrap();
-                    let cur_host = st.host.clone();
-                    st.apply_detected_profile(DiscoveredNPort {
-                        ip_address: cur_host,
-                        mac_address: String::from("00:90:E8:56:10:08"),
-                        profile: new_prof,
-                        discovery_method: String::from("Simulated Model Switch"),
                     });
                 }
-
-                ui.separator();
-
-                // Stream Pause / Resume & Stop All Streams Controls
-                let pause_btn_text = if stream_paused {
-                    RichText::new(format!("▶ Resume Stream ({paused_skipped} skipped)"))
-                        .color(Color32::BLACK)
-                        .strong()
-                } else {
-                    RichText::new("⏸ Pause Stream").color(Color32::WHITE)
-                };
-                let pause_btn = egui::Button::new(pause_btn_text).fill(if stream_paused {
-                    Color32::from_rgb(245, 175, 40)
-                } else {
-                    Color32::from_rgb(55, 65, 81)
-                });
-                if ui.add(pause_btn).clicked() {
-                    self.ctrl.state.lock().unwrap().toggle_pause();
-                }
-
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("⏹ Stop All Streams").color(Color32::from_rgb(255, 140, 140)),
-                        )
-                        .fill(Color32::from_rgb(65, 35, 40)),
-                    )
-                    .clicked()
-                {
-                    self.ctrl.stop_all_streams();
-                }
-
-                ui.separator();
-
-                // On-Demand Stream Logging & Buffer Dump Buttons
-                let is_logging = active_log_path.is_some();
-                let log_btn_text = if let Some(ref p) = active_log_path {
-                    RichText::new(format!("● REC: {}", p.display()))
-                        .color(Color32::WHITE)
-                        .strong()
-                } else {
-                    RichText::new("⏺ Start Live Log").color(Color32::WHITE)
-                };
-                let log_btn = egui::Button::new(log_btn_text).fill(if is_logging {
-                    Color32::from_rgb(200, 40, 40)
-                } else {
-                    Color32::from_rgb(55, 65, 81)
-                });
-                if ui.add(log_btn).clicked() {
-                    self.ctrl.state.lock().unwrap().toggle_jsonl(None);
-                }
-
-                if ui
-                    .button(
-                        RichText::new("⬇ Dump Buffer to Log Now")
-                            .color(Color32::from_rgb(120, 240, 160)),
-                    )
-                    .clicked()
-                {
-                    self.ctrl.state.lock().unwrap().dump_buffer_on_demand(None);
-                }
-
-                if ui.button("🗑 Clear Buffer").clicked() {
-                    let mut st = self.ctrl.state.lock().unwrap();
-                    st.frames.clear();
-                    self.selected_frame_seq = None;
-                    st.log_event("Cleared packet inspector display buffer");
-                }
             });
-
-            if !self.discovered_units.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Discovered on LAN:").color(Color32::YELLOW));
-                    for u in self.discovered_units.clone() {
-                        if ui
-                            .small_button(format!(
-                                "{} ({}) [{}]",
-                                u.ip_address, u.profile.model_name, u.mac_address
-                            ))
-                            .clicked()
-                        {
-                            self.ip_input = u.ip_address.clone();
-                            let ctrl = self.ctrl.clone();
-                            self.rt.spawn(async move {
-                                ctrl.switch_target_host(u.ip_address).await;
-                            });
-                        }
-                    }
-                });
-            }
-            ui.add_space(4.0);
-        });
 
         // -------------------------------------------------------------------
         // 2. Bottom Panel: Event Log & Selected Frame Byte/Bit Dissector
         // -------------------------------------------------------------------
-        egui::TopBottomPanel::bottom("bottom_status_and_dissector")
-            .resizable(true)
-            .min_height(130.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                // Transmit / Inject & Log Note Bar
-                ui.horizontal(|ui| {
+        if self.show_bottom_dissector {
+            egui::TopBottomPanel::bottom("bottom_status_and_dissector")
+                .resizable(true)
+                .min_height(125.0)
+                .show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    // Transmit / Inject & Log Note Bar
+                    ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!("TX Inject (P{}):", self.selected_port))
                             .color(Color32::from_rgb(230, 140, 255))
@@ -488,6 +544,7 @@ impl eframe::App for SmtGuiApp {
                         });
                 });
             });
+        }
 
         // -------------------------------------------------------------------
         // 3. Central Panel: Adaptive Port Matrix + Live Serial Frame Inspector
@@ -518,6 +575,19 @@ impl eframe::App for SmtGuiApp {
                         );
 
                         ui.separator();
+
+                        // Quick port selector pills when the full port matrix is hidden
+                        if !self.show_port_matrix {
+                            for p in 1..=profile.port_count {
+                                if ui
+                                    .selectable_label(self.selected_port == p, format!("P{p}"))
+                                    .clicked()
+                                {
+                                    self.selected_port = p;
+                                }
+                            }
+                            ui.separator();
+                        }
 
                         let is_conn = ports
                             .get((self.selected_port - 1) as usize)
@@ -637,114 +707,161 @@ impl eframe::App for SmtGuiApp {
                     });
                 });
 
-            ui.add_space(6.0);
+            ui.add_space(4.0);
 
             // 3B. Adaptive Multi-Port Hardware Status Grid (1..=port_count)
-            egui::Grid::new("nport_ports_grid")
-                .striped(true)
-                .spacing([12.0, 4.0])
-                .show(ui, |ui| {
-                    for hdr in [
-                        "Select",
-                        "Data / ASPP",
-                        "Active Role",
-                        "UART / Iface / Flow",
-                        "Outputs (Pin 4 / 7)",
-                        "Inputs (Pin 8 / 6 / 1)",
-                        "RX (Frames / Bytes)",
-                        "TX (Frames / Bytes)",
-                    ] {
-                        ui.label(
-                            RichText::new(hdr)
-                                .color(Color32::from_rgb(0, 210, 255))
-                                .strong(),
-                        );
-                    }
-                    ui.end_row();
+            if self.show_port_matrix {
+                ScrollArea::vertical()
+                    .id_salt("nport_ports_matrix_scroll")
+                    .max_height(185.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("nport_ports_grid")
+                            .striped(true)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                for hdr in [
+                                    "Select",
+                                    "Data / ASPP",
+                                    "Active Role",
+                                    "UART / Iface / Flow",
+                                    "Outputs (Pin 4 / 7)",
+                                    "Inputs (Pin 8 / 6 / 1)",
+                                    "RX (Frames / Bytes)",
+                                    "TX (Frames / Bytes)",
+                                ] {
+                                    ui.label(
+                                        RichText::new(hdr)
+                                            .color(Color32::from_rgb(0, 210, 255))
+                                            .strong(),
+                                    );
+                                }
+                                ui.end_row();
 
-                    for ps in &ports {
-                        let is_sel = ps.port_num == self.selected_port;
-                        let name_suffix = if ps.alias.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" ({})", ps.alias)
-                        };
-                        let btn_label = if is_sel {
-                            format!("▶ Port {}{}", ps.port_num, name_suffix)
-                        } else {
-                            format!("  Port {}{}", ps.port_num, name_suffix)
-                        };
-                        let btn = egui::Button::new(
-                            RichText::new(btn_label)
-                                .monospace()
-                                .strong()
-                                .color(if is_sel {
-                                    Color32::BLACK
-                                } else {
-                                    Color32::WHITE
-                                }),
-                        )
-                        .fill(if is_sel {
-                            Color32::from_rgb(0, 200, 240)
-                        } else {
-                            Color32::from_rgb(45, 52, 64)
-                        });
-                        if ui.add(btn).clicked() {
-                            self.selected_port = ps.port_num;
-                        }
+                                for ps in &ports {
+                                    let is_sel = ps.port_num == self.selected_port;
+                                    let name_suffix = if ps.alias.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" ({})", ps.alias)
+                                    };
+                                    let btn_label = if is_sel {
+                                        format!("▶ Port {}{}", ps.port_num, name_suffix)
+                                    } else {
+                                        format!("  Port {}{}", ps.port_num, name_suffix)
+                                    };
+                                    let btn = egui::Button::new(
+                                        RichText::new(btn_label)
+                                            .monospace()
+                                            .strong()
+                                            .color(if is_sel {
+                                                Color32::BLACK
+                                            } else {
+                                                Color32::WHITE
+                                            }),
+                                    )
+                                    .fill(if is_sel {
+                                        Color32::from_rgb(0, 200, 240)
+                                    } else {
+                                        Color32::from_rgb(45, 52, 64)
+                                    });
+                                    if ui.add(btn).clicked() {
+                                        self.selected_port = ps.port_num;
+                                    }
 
-                        ui.label(
-                            RichText::new(format!(":{} / :{}", ps.data_tcp_port(), ps.aspp_tcp_port()))
-                                .monospace(),
-                        );
+                                    ui.label(
+                                        RichText::new(format!(
+                                            ":{} / :{}",
+                                            ps.data_tcp_port(),
+                                            ps.aspp_tcp_port()
+                                        ))
+                                        .monospace(),
+                                    );
 
-                        let role_col = if ps.connected {
-                            Color32::LIGHT_GREEN
-                        } else {
-                            Color32::GRAY
-                        };
-                        let role_lbl = if ps.role == "IDLE" {
-                            format!("IDLE ({})", ps.op_mode)
-                        } else {
-                            ps.role.clone()
-                        };
-                        ui.label(RichText::new(role_lbl).color(role_col).monospace().strong());
+                                    let role_col = if ps.connected {
+                                        Color32::LIGHT_GREEN
+                                    } else {
+                                        Color32::GRAY
+                                    };
+                                    let role_lbl = if ps.role == "IDLE" {
+                                        format!("IDLE ({})", ps.op_mode)
+                                    } else {
+                                        ps.role.clone()
+                                    };
+                                    ui.label(
+                                        RichText::new(role_lbl)
+                                            .color(role_col)
+                                            .monospace()
+                                            .strong(),
+                                    );
 
-                        ui.label(
-                            RichText::new(format!(
-                                "{} {} | {} | {}",
-                                ps.baud,
-                                ps.framing.as_str(),
-                                ps.interface.as_str(),
-                                ps.flow_control.as_str()
-                            ))
-                            .monospace(),
-                        );
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} {} | {} | {}",
+                                            ps.baud,
+                                            ps.framing.as_str(),
+                                            ps.interface.as_str(),
+                                            ps.flow_control.as_str()
+                                        ))
+                                        .monospace(),
+                                    );
 
-                        ui.horizontal(|ui| {
-                            led_badge(ui, "DTR", ps.dtr, Color32::from_rgb(220, 120, 255));
-                            led_badge(ui, "RTS", ps.rts, Color32::from_rgb(220, 120, 255));
-                        });
+                                    ui.horizontal(|ui| {
+                                        led_badge(
+                                            ui,
+                                            "DTR",
+                                            ps.dtr,
+                                            Color32::from_rgb(220, 120, 255),
+                                        );
+                                        led_badge(
+                                            ui,
+                                            "RTS",
+                                            ps.rts,
+                                            Color32::from_rgb(220, 120, 255),
+                                        );
+                                    });
 
-                        ui.horizontal(|ui| {
-                            led_badge(ui, "CTS", ps.modem.cts, Color32::from_rgb(80, 230, 130));
-                            led_badge(ui, "DSR", ps.modem.dsr, Color32::from_rgb(80, 230, 130));
-                            led_badge(ui, "DCD", ps.modem.dcd, Color32::from_rgb(255, 190, 60));
-                        });
+                                    ui.horizontal(|ui| {
+                                        led_badge(
+                                            ui,
+                                            "CTS",
+                                            ps.modem.cts,
+                                            Color32::from_rgb(80, 230, 130),
+                                        );
+                                        led_badge(
+                                            ui,
+                                            "DSR",
+                                            ps.modem.dsr,
+                                            Color32::from_rgb(80, 230, 130),
+                                        );
+                                        led_badge(
+                                            ui,
+                                            "DCD",
+                                            ps.modem.dcd,
+                                            Color32::from_rgb(255, 190, 60),
+                                        );
+                                    });
 
-                        ui.label(
-                            RichText::new(format!("{:>4} / {:>6} B", ps.rx_frames, ps.rx_bytes))
-                                .monospace(),
-                        );
-                        ui.label(
-                            RichText::new(format!("{:>4} / {:>6} B", ps.tx_frames, ps.tx_bytes))
-                                .monospace(),
-                        );
-                        ui.end_row();
-                    }
-                });
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{:>4} / {:>6} B",
+                                            ps.rx_frames, ps.rx_bytes
+                                        ))
+                                        .monospace(),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{:>4} / {:>6} B",
+                                            ps.tx_frames, ps.tx_bytes
+                                        ))
+                                        .monospace(),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    });
 
-            ui.separator();
+                ui.separator();
+            }
 
             // 3C. View Mode Switcher + Stream Filter & Terminal Options Toolbar
             egui::Frame::none()
@@ -787,6 +904,22 @@ impl eframe::App for SmtGuiApp {
                             .clicked()
                         {
                             self.view_mode = CentreViewMode::PacketInspector;
+                        }
+
+                        let pane_expanded = !self.show_port_matrix && !self.show_bottom_dissector;
+                        let expand_lbl = if pane_expanded {
+                            "⤡ Restore Matrix & Dissector"
+                        } else {
+                            "⤢ Maximise Active Pane"
+                        };
+                        if ui.button(expand_lbl).clicked() {
+                            if pane_expanded {
+                                self.show_port_matrix = true;
+                                self.show_bottom_dissector = true;
+                            } else {
+                                self.show_port_matrix = false;
+                                self.show_bottom_dissector = false;
+                            }
                         }
 
                         ui.separator();
@@ -1199,7 +1332,7 @@ impl SmtGuiApp {
             .inner_margin(egui::Margin::symmetric(8.0, 6.0))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.set_min_height(ui.available_height().max(120.0));
+                ui.set_min_height(ui.available_height().max(40.0));
                 ScrollArea::vertical()
                     .id_salt("putty_terminal_scroll")
                     .stick_to_bottom(true)
@@ -1243,7 +1376,8 @@ impl SmtGuiApp {
                     });
             });
 
-        if term_frame.response.interact(egui::Sense::click()).clicked() {
+        let click_rect = term_frame.response.rect.intersect(ui.clip_rect());
+        if ui.rect_contains_pointer(click_rect) && ui.input(|i| i.pointer.primary_clicked()) {
             if let Some(focused_id) = ctx.memory(|m| m.focused()) {
                 ctx.memory_mut(|m| m.surrender_focus(focused_id));
             }
@@ -1389,12 +1523,14 @@ impl SmtGuiApp {
 fn main() -> eframe::Result<()> {
     let mut host = String::from("192.168.1.249");
     let mut demo = false;
+    let mut fullscreen = false;
 
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--demo" => demo = true,
+            "-f" | "--fullscreen" => fullscreen = true,
             "-h" | "--help" => {
-                println!("Usage: smt-gui [NPORT_IP] [--demo]");
+                println!("Usage: moxa-gui [NPORT_IP] [--demo] [--fullscreen]");
                 return Ok(());
             }
             other if !other.starts_with('-') => host = other.to_string(),
@@ -1402,17 +1538,56 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    // Do NOT set `.with_min_inner_size([960.0, 600.0])`: on Wayland compositors with
+    // fractional scaling (e.g. 1.25 scale where initial wl_output scale is 2), egui-winit
+    // multiplies min_inner_size by 2 before wp_fractional_scale_v1 arrives, sending
+    // xdg_toplevel.set_min_size(1920, 1200) on a 1536x960 logical screen and desynchronising
+    // pointer hit-testing from the rendered topbar controls.
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SMT Control System — Moxa NPort Adaptive GUI Console")
-            .with_inner_size([1340.0, 820.0])
-            .with_min_inner_size([960.0, 600.0]),
+            .with_app_id("moxa-controller")
+            .with_title("Moxa Controller — NPort Adaptive GUI Console")
+            .with_inner_size([1200.0, 760.0])
+            .with_fullscreen(fullscreen),
         ..Default::default()
     };
 
     eframe::run_native(
-        "SMT Control System — Moxa NPort Adaptive GUI Console",
+        "Moxa Controller — NPort Adaptive GUI Console",
         native_options,
-        Box::new(move |cc| Ok(Box::new(SmtGuiApp::new(cc, host, demo)))),
+        Box::new(move |cc| Ok(Box::new(SmtGuiApp::new(cc, host, demo, fullscreen)))),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_viewport_builder_has_no_broken_min_size_constraint() {
+        let vp = egui::ViewportBuilder::default()
+            .with_app_id("moxa-controller")
+            .with_title("Moxa Controller — NPort Adaptive GUI Console")
+            .with_inner_size([1200.0, 760.0])
+            .with_fullscreen(true);
+
+        assert_eq!(vp.app_id.as_deref(), Some("moxa-controller"));
+        assert_eq!(vp.fullscreen, Some(true));
+        // Ensure min_inner_size is None so Wayland fractional scaling never locks surface size
+        assert_eq!(vp.min_inner_size, None);
+    }
+
+    #[test]
+    fn test_terminal_click_rect_clips_against_topbar() {
+        let topbar_clip =
+            egui::Rect::from_min_max(egui::pos2(0.0, 60.0), egui::pos2(1200.0, 760.0));
+        let overflowing_frame =
+            egui::Rect::from_min_max(egui::pos2(0.0, 10.0), egui::pos2(1200.0, 700.0));
+        let clipped = overflowing_frame.intersect(topbar_clip);
+        // Click at y=25.0 (inside topbar) must NOT fall inside the clipped terminal rect
+        assert!(!clipped.contains(egui::pos2(200.0, 25.0)));
+        // Click at y=200.0 (inside central terminal) MUST fall inside the clipped terminal rect
+        assert!(clipped.contains(egui::pos2(200.0, 200.0)));
+    }
+}
+

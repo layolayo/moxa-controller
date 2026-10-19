@@ -1,10 +1,10 @@
 [package]
-name = "smt-tui"
+name = "moxa-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Interactive ratatui terminal console for Moxa NPort 5610-8-DT connection, configuration, and RS-232 protocol sniffing"
+description = "Interactive ratatui terminal console for Moxa NPort 5610-8-DT connection, configuration, and serial port inspection"
 
 [dependencies]
 anyhow.workspace = true

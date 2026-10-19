@@ -1,9 +1,9 @@
 [workspace]
 members = [
     "crates/nport5610-core",
-    "crates/smt-tui",
-    "crates/smt-daemon",
-    "crates/smt-gui",
+    "crates/moxa-tui",
+    "crates/moxa-daemon",
+    "crates/moxa-gui",
 ]
 resolver = "2"
 
