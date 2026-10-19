@@ -1,7 +1,7 @@
-//! `smt-daemon` — 24/7 Moxa NPort Background Service & Local IPC Bridge
+//! `moxa-daemon` — 24/7 Moxa NPort Background Service & Local IPC Bridge
 //!
 //! Designed to run on the dedicated Linux box (under `systemd` or alongside the
-//! Wayland desktop SMT control software):
+//! Wayland desktop Moxa controller suite):
 //!   1. Automatically polls and identifies the Moxa NPort hardware model (`5610-8-DT`, `5450`, etc.).
 //!   2. Supervises persistent TCP Data (`4001..`) and ASPP (`966..`) channels.
 //!   3. Exposes a local IPC socket (`127.0.0.1:7450`) supporting:
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
                 }
             }
             "-h" | "--help" => {
-                println!("Usage: smt-daemon [NPORT_IP] [--ipc 127.0.0.1:7450] [--demo] [--once]");
+                println!("Usage: moxa-daemon [NPORT_IP] [--ipc 127.0.0.1:7450] [--demo] [--once]");
                 return Ok(());
             }
             other if !other.starts_with('-') => host = other.to_string(),
@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
     {
         let st = ctrl.state.lock().unwrap();
         println!(
-            "[smt-daemon] Active Target: {} | Detected Model: {} ({}-Port {}, {}) via {}",
+            "[moxa-daemon] Active Target: {} | Detected Model: {} ({}-Port {}, {}) via {}",
             st.host,
             st.profile.model_name,
             st.profile.port_count,
@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
     }
 
     let listener = TcpListener::bind(&ipc_addr).await?;
-    println!("[smt-daemon] Local Wayland GUI / IPC server listening on {ipc_addr}");
+    println!("[moxa-daemon] Local Wayland GUI / IPC server listening on {ipc_addr}");
 
     let ctrl_ipc = ctrl.clone();
     tokio::spawn(async move {
@@ -202,6 +202,6 @@ async fn main() -> Result<()> {
     });
 
     tokio::signal::ctrl_c().await?;
-    println!("\n[smt-daemon] Shutting down cleanly.");
+    println!("\n[moxa-daemon] Shutting down cleanly.");
     Ok(())
 }

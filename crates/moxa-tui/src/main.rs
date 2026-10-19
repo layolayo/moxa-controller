@@ -1,4 +1,4 @@
-//! `smt-tui` — High-frame-rate `ratatui` Operator & Reverse-Engineering Console
+//! `moxa-tui` — High-frame-rate `ratatui` Operator & Serial Console
 //! for Moxa NPort Serial Device Servers (`NPort 5610-8-DT`, `5450`, `5250A`, `5110`, etc.).
 //!
 //! Includes on-demand stream logging (`[l]`), instant rolling-buffer dump to disk (`[w]`),
@@ -840,7 +840,7 @@ async fn main() -> Result<()> {
             }
             "-h" | "--help" => {
                 println!(
-                    "Usage: smt-tui [NPORT_IP] [--demo] [--log] [--snapshot] [--gap-ms MS]"
+                    "Usage: moxa-tui [NPORT_IP] [--demo] [--log] [--snapshot] [--gap-ms MS]"
                 );
                 return Ok(());
             }

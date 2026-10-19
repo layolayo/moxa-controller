@@ -661,7 +661,7 @@ class NPort5610Controller:
         st.last_activity = dt.datetime.now().strftime("%H:%M:%S")
         self._record_frame(port_num, f"P{port_num} TX→LINE", data)
 
-        # In simulation mode, synthesize a realistic SMT device reply
+        # In simulation mode, synthesise a realistic serial device reply
         if self.simulate:
             reply = b"\x02ACK:" + data[:12] + b"\x03\x17"
             self.ports[port_num].rx_bytes += len(reply)

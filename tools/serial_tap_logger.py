@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SMT Control System — Dual-Channel RS-232 Tap & MITM Protocol Logger
+Moxa NPort Controller — Dual-Channel RS-232 Tap & MITM Protocol Logger
 
 Supports:
   1. Networked Moxa NPort TCP Server endpoints (e.g. tcp://192.168.127.254:4001)

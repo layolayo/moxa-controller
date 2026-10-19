@@ -786,7 +786,7 @@ pub async fn auto_detect_nport_model(host: &str, timeout: Duration) -> Discovere
         tokio::time::timeout(timeout, TcpStream::connect(format!("{host}:80"))).await
     {
         let req = format!(
-            "GET /main.htm HTTP/1.0\r\nHost: {host}\r\nUser-Agent: smt-control-system/0.1\r\n\r\n"
+            "GET /main.htm HTTP/1.0\r\nHost: {host}\r\nUser-Agent: moxa-controller/0.1\r\n\r\n"
         );
         if stream.write_all(req.as_bytes()).await.is_ok() {
             let mut buf = vec![0u8; 4096];
@@ -1699,7 +1699,7 @@ impl SharedEngineState {
             (Ok(jf), Ok(mut tf)) => {
                 let _ = writeln!(
                     tf,
-                    "# SMT Control System Live Stream Log — {} ({}) @ {}",
+                    "# Moxa NPort Controller Live Stream Log — {} ({}) @ {}",
                     self.profile.model_name, self.host, stamp
                 );
                 let _ = tf.flush();
@@ -1757,7 +1757,7 @@ impl SharedEngineState {
 
         let _ = writeln!(
             tf,
-            "# SMT Control System On-Demand Buffer Dump — {} ({}-Port {}) @ {}",
+            "# Moxa NPort Controller On-Demand Buffer Dump — {} ({}-Port {}) @ {}",
             self.profile.model_name, self.profile.port_count, self.profile.interfaces, self.host
         );
         let _ = writeln!(

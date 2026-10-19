@@ -1,5 +1,5 @@
-//! `moxa-gui` (`smt-gui`) — Native Wayland/X11 Desktop GUI for Moxa NPort Connection,
-//! Configuration, On-Demand Logging, and RS-232/422/485 Protocol Reverse-Engineering.
+//! `moxa-gui` — Native Wayland/X11 Desktop GUI for Moxa NPort Connection,
+//! Configuration, On-Demand Logging, and RS-232/422/485 Protocol Analysis.
 
 use std::time::Duration;
 
@@ -18,7 +18,22 @@ enum CentreViewMode {
     PacketInspector,
 }
 
-struct SmtGuiApp {
+/// Determine whether the window surface covers the top edge of the monitor (`y = 0..26`),
+/// where a Wayland `WlrLayer.Top` bar (such as `omarchy-bar`) intercepts pointer clicks.
+fn viewport_covers_top_bar(
+    is_fullscreen: bool,
+    screen_rect: egui::Rect,
+    monitor_size: Option<egui::Vec2>,
+) -> bool {
+    if let Some(mon_sz) = monitor_size {
+        if mon_sz.y > 0.0 {
+            return screen_rect.height() >= mon_sz.y - 4.0;
+        }
+    }
+    is_fullscreen
+}
+
+struct MoxaGuiApp {
     rt: tokio::runtime::Runtime,
     ctrl: NPortController,
     ip_input: String,
@@ -35,11 +50,12 @@ struct SmtGuiApp {
     demo_model_idx: usize,
     auto_scroll: bool,
     is_fullscreen: bool,
+    last_viewport_fullscreen: Option<bool>,
     show_port_matrix: bool,
     show_bottom_dissector: bool,
 }
 
-impl SmtGuiApp {
+impl MoxaGuiApp {
     fn new(
         cc: &eframe::CreationContext<'_>,
         initial_host: String,
@@ -78,6 +94,7 @@ impl SmtGuiApp {
             demo_model_idx: 0,
             auto_scroll: true,
             is_fullscreen: start_fullscreen,
+            last_viewport_fullscreen: Some(false),
             show_port_matrix: true,
             show_bottom_dissector: true,
         }
@@ -99,14 +116,20 @@ fn led_badge(ui: &mut egui::Ui, label: &str, active: bool, on_colour: Color32) {
         });
 }
 
-impl eframe::App for SmtGuiApp {
+impl eframe::App for MoxaGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Repaint at ~20 Hz so live serial traffic updates smoothly
         ctx.request_repaint_after(Duration::from_millis(50));
 
-        // Sync fullscreen state with the Wayland/X11 viewport if reported by the compositor
-        if let Some(vp_fs) = ctx.input(|i| i.viewport().fullscreen) {
-            self.is_fullscreen = vp_fs;
+        // Sync fullscreen state with the Wayland/X11 viewport only when the compositor's
+        // reported state actually changes, avoiding clobbering `self.is_fullscreen` while an
+        // asynchronous Wayland `xdg_toplevel.configure` roundtrip is still in flight.
+        let vp_fs = ctx.input(|i| i.viewport().fullscreen);
+        if vp_fs != self.last_viewport_fullscreen {
+            if let Some(fs) = vp_fs {
+                self.is_fullscreen = fs;
+            }
+            self.last_viewport_fullscreen = vp_fs;
         }
 
         // Toggle fullscreen via F11 shortcut
@@ -163,11 +186,14 @@ impl eframe::App for SmtGuiApp {
         // -------------------------------------------------------------------
         // 1. Top Panel: Moxa IP Connection, Model Auto-Detection & Logging
         // -------------------------------------------------------------------
-        // On Wayland/Hyprland, a fullscreen window covers y=0..960 visually over the 26px
-        // WlrLayer.Top status bar (`omarchy-bar` at y=0..26), but the compositor layer surface
-        // still intercepts pointer clicks in y=0..26. Applying a 30px top safe-area margin
-        // when fullscreen ensures all GUI topbar controls sit below y=26 and receive mouse clicks.
-        let covers_top_bar = self.is_fullscreen || ctx.screen_rect().height() >= 945.0;
+        // On Wayland/Hyprland, a true fullscreen window covers the full monitor height (`y = 0..H`)
+        // visually over the 26px `WlrLayer.Top` status bar (`omarchy-bar` at `y = 0..26`), while
+        // the compositor layer surface still intercepts pointer clicks in `y = 0..26`. Applying a
+        // 30px top safe-area margin when the window spans the full monitor height ensures all GUI
+        // topbar controls sit below `y = 26` and reliably receive mouse clicks.
+        let monitor_size = ctx.input(|i| i.viewport().monitor_size);
+        let covers_top_bar =
+            viewport_covers_top_bar(self.is_fullscreen, ctx.screen_rect(), monitor_size);
         let top_safe_margin = if covers_top_bar { 30.0 } else { 6.0 };
         egui::TopBottomPanel::top("top_connection_bar")
             .frame(
@@ -355,7 +381,7 @@ impl eframe::App for SmtGuiApp {
                 });
 
                 if !self.discovered_units.is_empty() {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("Discovered on LAN:").color(Color32::YELLOW));
                         for u in self.discovered_units.clone() {
                             if ui
@@ -386,7 +412,7 @@ impl eframe::App for SmtGuiApp {
                 .show(ctx, |ui| {
                     ui.add_space(4.0);
                     // Transmit / Inject & Log Note Bar
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(format!("TX Inject (P{}):", self.selected_port))
                             .color(Color32::from_rgb(230, 140, 255))
@@ -1224,7 +1250,7 @@ impl eframe::App for SmtGuiApp {
     }
 }
 
-impl SmtGuiApp {
+impl MoxaGuiApp {
     fn render_putty_terminal_pane(
         &mut self,
         ui: &mut egui::Ui,
@@ -1288,7 +1314,7 @@ impl SmtGuiApp {
         });
 
         // Line command bar for sending complete lines or commands
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new("Line TX:")
                     .color(Color32::from_rgb(0, 210, 255))
@@ -1565,7 +1591,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Moxa Controller — NPort Adaptive GUI Console",
         native_options,
-        Box::new(move |cc| Ok(Box::new(SmtGuiApp::new(cc, host, demo, fullscreen)))),
+        Box::new(move |cc| Ok(Box::new(MoxaGuiApp::new(cc, host, demo, fullscreen)))),
     )
 }
 
@@ -1598,6 +1624,142 @@ mod tests {
         assert!(!clipped.contains(egui::pos2(200.0, 25.0)));
         // Click at y=200.0 (inside central terminal) MUST fall inside the clipped terminal rect
         assert!(clipped.contains(egui::pos2(200.0, 200.0)));
+    }
+
+    #[test]
+    fn test_viewport_covers_top_bar_across_monitors_and_modes() {
+        let mon_1536x960 = Some(egui::vec2(1536.0, 960.0));
+        let mon_1920x1080 = Some(egui::vec2(1920.0, 1080.0));
+
+        // 1. Half-tiled on 1536x960 (760x926 at y=30): does NOT cover top bar
+        let rect_tiled_960 =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 926.0));
+        assert!(!viewport_covers_top_bar(false, rect_tiled_960, mon_1536x960));
+
+        // 2. Omarchy Tiled Fullscreen (SUPER+CTRL+F: client fullscreen=true, but tiled 1528x926 below bar):
+        // must NOT apply redundant 30px safe-area margin
+        let rect_tiled_fs_960 =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1528.0, 926.0));
+        assert!(!viewport_covers_top_bar(
+            true,
+            rect_tiled_fs_960,
+            mon_1536x960
+        ));
+
+        // 3. True Fullscreen on 1536x960 (1536x960 at y=0): DOES cover top bar
+        let rect_true_fs_960 =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1536.0, 960.0));
+        assert!(viewport_covers_top_bar(false, rect_true_fs_960, mon_1536x960));
+        assert!(viewport_covers_top_bar(true, rect_true_fs_960, mon_1536x960));
+
+        // 4. Tiled window on 1920x1080 (1912x1046 at y=30): must NOT cover top bar
+        let rect_tiled_1080 =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1912.0, 1046.0));
+        assert!(!viewport_covers_top_bar(
+            false,
+            rect_tiled_1080,
+            mon_1920x1080
+        ));
+
+        // 5. True Fullscreen on 1920x1080 (1920x1080 at y=0): DOES cover top bar
+        let rect_true_fs_1080 =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        assert!(viewport_covers_top_bar(
+            true,
+            rect_true_fs_1080,
+            mon_1920x1080
+        ));
+
+        // 6. Fallback when monitor_size is not yet reported by the compositor
+        assert!(viewport_covers_top_bar(true, rect_tiled_960, None));
+        assert!(!viewport_covers_top_bar(false, rect_tiled_960, None));
+    }
+
+    #[test]
+    fn test_fullscreen_topbar_buttons_receive_clicks_in_egui_pass() {
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1536.0, 960.0));
+        let monitor_size = Some(egui::vec2(1536.0, 960.0));
+        let mut btn_rect = egui::Rect::NOTHING;
+        let mut clicked = false;
+
+        // Pass 1: layout the fullscreen topbar and record the button rect
+        let mut raw_input = egui::RawInput {
+            screen_rect: Some(screen_rect),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw_input.clone(), |ctx| {
+            let covers = viewport_covers_top_bar(true, ctx.screen_rect(), monitor_size);
+            let top_safe_margin = if covers { 30.0 } else { 6.0 };
+            egui::TopBottomPanel::top("top_connection_bar")
+                .frame(
+                    egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
+                        left: 10.0,
+                        right: 10.0,
+                        top: top_safe_margin,
+                        bottom: 6.0,
+                    }),
+                )
+                .show(ctx, |ui| {
+                    let resp = ui.button("🔌 Connect & Auto-Detect");
+                    btn_rect = resp.rect;
+                });
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let term_frame = egui::Frame::none().show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                });
+                let click_rect = term_frame.response.rect.intersect(ui.clip_rect());
+                assert!(!click_rect.intersects(btn_rect));
+            });
+        });
+
+        // Verify the topbar button sits below the 26px Wayland WlrLayer.Top bar
+        assert!(
+            btn_rect.min.y >= 26.0,
+            "Expected topbar button min.y >= 26.0 in fullscreen, got {}",
+            btn_rect.min.y
+        );
+
+        // Pass 2: simulate primary mouse click (press + release) at the centre of the topbar button
+        let click_pos = btn_rect.center();
+        raw_input.events = vec![
+            egui::Event::PointerMoved(click_pos),
+            egui::Event::PointerButton {
+                pos: click_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: click_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let _ = ctx.run(raw_input, |ctx| {
+            let covers = viewport_covers_top_bar(true, ctx.screen_rect(), monitor_size);
+            let top_safe_margin = if covers { 30.0 } else { 6.0 };
+            egui::TopBottomPanel::top("top_connection_bar")
+                .frame(
+                    egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
+                        left: 10.0,
+                        right: 10.0,
+                        top: top_safe_margin,
+                        bottom: 6.0,
+                    }),
+                )
+                .show(ctx, |ui| {
+                    if ui.button("🔌 Connect & Auto-Detect").clicked() {
+                        clicked = true;
+                    }
+                });
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_min_size(ui.available_size());
+            });
+        });
+
+        assert!(clicked, "Topbar button click must register in fullscreen mode");
     }
 }
 
