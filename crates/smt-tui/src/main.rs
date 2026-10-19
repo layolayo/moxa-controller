@@ -8,7 +8,7 @@ use std::io;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -434,17 +434,19 @@ fn render_ui(frame: &mut Frame, ctrl: &NPortController, ui: &AppUiState) {
                             .bg(Color::Green)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw("  Every keystroke transmits live over RS-232!"),
+                    Span::raw("  Every keystroke (incl. Ctrl+C/D/Z & Arrows) transmits live over RS-232!"),
                 ]),
                 Line::from(vec![
                     Span::styled("[F1]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw(format!(" Local Echo: {echo_lbl}   ")),
+                    Span::raw(format!(" Local Echo: {echo_lbl}  ")),
                     Span::styled("[F2]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::raw(format!(" Enter Sends: {crlf_lbl}   ")),
+                    Span::raw(format!(" Enter: {crlf_lbl}  ")),
                     Span::styled("[F3]", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-                    Span::raw(" Clear Terminal   "),
+                    Span::raw(" Clear  "),
+                    Span::styled("[F4]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw(" Cycle Baud  "),
                     Span::styled("[Esc]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-                    Span::raw(" Exit Live Typing Mode (Return to Hotkeys)"),
+                    Span::raw(" Exit Live Typing Mode"),
                 ]),
             ])
             .block(
@@ -561,6 +563,7 @@ fn render_terminal_viewer(
 ) {
     let is_live_typing = ui.prompt_kind == PromptKind::LiveTerminal;
     let max_rows = area.height.saturating_sub(2) as usize;
+    let inner_cols = area.width.saturating_sub(2).max(20) as usize;
 
     let Some(ps) = st.ports.get((ui.selected_port - 1) as usize) else {
         return;
@@ -606,8 +609,19 @@ fn render_terminal_viewer(
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )));
     } else {
-        let start = raw_lines.len().saturating_sub(max_rows.max(1));
-        for l in &raw_lines[start..] {
+        let mut wrapped_lines: Vec<String> = Vec::new();
+        for l in &raw_lines {
+            if l.is_empty() {
+                wrapped_lines.push(String::new());
+            } else {
+                let chars: Vec<char> = l.chars().collect();
+                for chunk in chars.chunks(inner_cols) {
+                    wrapped_lines.push(chunk.iter().collect());
+                }
+            }
+        }
+        let start = wrapped_lines.len().saturating_sub(max_rows.max(1));
+        for l in &wrapped_lines[start..] {
             lines.push(Line::from(Span::styled(
                 l.clone(),
                 Style::default().fg(Color::Green),
@@ -621,7 +635,7 @@ fn render_terminal_viewer(
         Color::Cyan
     };
     let mode_hint = if is_live_typing {
-        "🟢 LIVE TYPING ACTIVE (Esc=Exit, F1=Echo, F2=CR+LF, F3=Clear)"
+        "🟢 LIVE TYPING ACTIVE (Esc=Exit, F1=Echo, F2=CR+LF, F3=Clear, F4=Baud)"
     } else {
         "Press [Enter] to Type Live | [Tab] Packet Inspector"
     };
@@ -667,7 +681,7 @@ fn render_frame_inspector(
     )]));
 
     for fr in visible {
-        let base_color = if fr.direction.contains("CTRL→DEV") || fr.direction.starts_with("P1") {
+        let base_colour = if fr.direction.contains("CTRL→DEV") || fr.direction.starts_with("P1") {
             Color::Cyan
         } else if fr.direction.contains("DEV→CTRL") || fr.direction.starts_with("P2") {
             Color::Yellow
@@ -686,7 +700,7 @@ fn render_frame_inspector(
                 fr.direction,
                 fr.payload.len()
             ),
-            Style::default().fg(base_color),
+            Style::default().fg(base_colour),
         )];
 
         let max_hex_bytes = 15usize;
@@ -698,7 +712,7 @@ fn render_frame_inspector(
                     .bg(Color::Magenta)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(base_color)
+                Style::default().fg(base_colour)
             };
             spans.push(Span::styled(format!("{b:02X}"), byte_style));
             spans.push(Span::raw(" "));
@@ -918,6 +932,9 @@ async fn run_event_loop(
                     }
                     st.log_event(format!("Cleared Port {} terminal screen", ui.selected_port));
                 }
+                KeyCode::F(4) => {
+                    ctrl.cycle_baud(ui.selected_port).await;
+                }
                 KeyCode::Enter => {
                     let crlf = { ctrl.state.lock().unwrap().terminal_crlf };
                     let bytes = if crlf {
@@ -930,13 +947,47 @@ async fn run_event_loop(
                 KeyCode::Backspace => {
                     ctrl.send_terminal_bytes(ui.selected_port, vec![0x08]).await;
                 }
+                KeyCode::Delete => {
+                    ctrl.send_terminal_bytes(ui.selected_port, b"\x1b[3~".to_vec())
+                        .await;
+                }
                 KeyCode::Tab => {
                     ctrl.send_terminal_bytes(ui.selected_port, vec![b'\t']).await;
                 }
+                KeyCode::Up => {
+                    ctrl.send_terminal_bytes(ui.selected_port, b"\x1b[A".to_vec())
+                        .await;
+                }
+                KeyCode::Down => {
+                    ctrl.send_terminal_bytes(ui.selected_port, b"\x1b[B".to_vec())
+                        .await;
+                }
+                KeyCode::Right => {
+                    ctrl.send_terminal_bytes(ui.selected_port, b"\x1b[C".to_vec())
+                        .await;
+                }
+                KeyCode::Left => {
+                    ctrl.send_terminal_bytes(ui.selected_port, b"\x1b[D".to_vec())
+                        .await;
+                }
+                KeyCode::Home => {
+                    ctrl.send_terminal_bytes(ui.selected_port, b"\x1b[H".to_vec())
+                        .await;
+                }
+                KeyCode::End => {
+                    ctrl.send_terminal_bytes(ui.selected_port, b"\x1b[F".to_vec())
+                        .await;
+                }
                 KeyCode::Char(c) => {
-                    let mut buf = [0u8; 4];
-                    let bytes = c.encode_utf8(&mut buf).as_bytes().to_vec();
-                    ctrl.send_terminal_bytes(ui.selected_port, bytes).await;
+                    if key.modifiers.contains(KeyModifiers::CONTROL) && c.is_ascii_alphabetic() {
+                        let ctrl_byte = (c.to_ascii_lowercase() as u8) - b'a' + 1;
+                        ctrl.send_terminal_bytes(ui.selected_port, vec![ctrl_byte])
+                            .await;
+                    } else {
+                        let mut buf = [0u8; 4];
+                        let bytes = c.encode_utf8(&mut buf).as_bytes().to_vec();
+                        ctrl.send_terminal_bytes(ui.selected_port, bytes).await;
+                    }
                 }
                 _ => {}
             }
@@ -992,6 +1043,12 @@ async fn run_event_loop(
                 _ => {}
             }
             continue;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
+            break;
         }
 
         let max_ports = { ctrl.state.lock().unwrap().profile.port_count };

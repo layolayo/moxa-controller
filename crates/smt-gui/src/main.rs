@@ -5,14 +5,14 @@ use std::time::Duration;
 
 use eframe::egui::{self, Color32, FontId, RichText, ScrollArea, Stroke};
 use nport5610_core::{
-    adjacent_port_pair, discover_nports_udp, parse_payload_input, DirectionFilter,
-    DiscoveredNPort, FrameFilter, NPortController, NPortModelProfile, SerialFrame,
+    adjacent_port_pair, discover_nports_udp, format_paste_bytes, parse_payload_input,
+    DirectionFilter, DiscoveredNPort, FrameFilter, NPortController, NPortModelProfile, SerialFrame,
 };
 
 const DEMO_MODEL_IDS: [u16; 4] = [0x5610, 0x5450, 0x5250, 0x5110];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CenterViewMode {
+enum CentreViewMode {
     PuttyTerminal,
     SplitTerminalAndPackets,
     PacketInspector,
@@ -23,7 +23,7 @@ struct SmtGuiApp {
     ctrl: NPortController,
     ip_input: String,
     selected_port: u8,
-    view_mode: CenterViewMode,
+    view_mode: CentreViewMode,
     terminal_live_keystrokes: bool,
     terminal_line_input: String,
     tx_payload_input: String,
@@ -58,7 +58,7 @@ impl SmtGuiApp {
             ctrl,
             ip_input: initial_host,
             selected_port: 1,
-            view_mode: CenterViewMode::SplitTerminalAndPackets,
+            view_mode: CentreViewMode::SplitTerminalAndPackets,
             terminal_live_keystrokes: true,
             terminal_line_input: String::new(),
             tx_payload_input: String::from("\\x0201POLL:99\\x03"),
@@ -92,6 +92,12 @@ impl eframe::App for SmtGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Repaint at ~20 Hz so live serial traffic updates smoothly
         ctx.request_repaint_after(Duration::from_millis(50));
+
+        // Record whether any TextEdit widget owned keyboard focus at the start of this frame
+        // so that pressing Enter inside a single-line TextEdit (which surrenders focus during ui.add)
+        // is never double-handled by the PuTTY live keystroke listener at the end of the frame.
+        let kb_claimed_before = ctx.wants_keyboard_input();
+        let mut text_edit_submitted = false;
 
         let (
             _host,
@@ -166,9 +172,11 @@ impl eframe::App for SmtGuiApp {
                         .desired_width(135.0)
                         .font(FontId::monospace(13.0)),
                 );
-                if ui.button("🔌 Connect & Auto-Detect").clicked()
-                    || (ip_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                {
+                let ip_enter = ip_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("🔌 Connect & Auto-Detect").clicked() || ip_enter {
+                    if ip_enter {
+                        text_edit_submitted = true;
+                    }
                     let new_ip = self.ip_input.trim().to_string();
                     let ctrl = self.ctrl.clone();
                     self.rt.spawn(async move {
@@ -324,9 +332,12 @@ impl eframe::App for SmtGuiApp {
                             .font(FontId::monospace(13.0))
                             .hint_text("ASCII e.g. \\x0201POLL\\x03 or hex:02 30 31 03"),
                     );
-                    if ui.button("🚀 Send Frame").clicked()
-                        || (tx_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                    {
+                    let tx_enter =
+                        tx_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("🚀 Send Frame").clicked() || tx_enter {
+                        if tx_enter {
+                            text_edit_submitted = true;
+                        }
                         match parse_payload_input(&self.tx_payload_input) {
                             Ok(bytes) => {
                                 let ctrl = self.ctrl.clone();
@@ -353,9 +364,12 @@ impl eframe::App for SmtGuiApp {
                             .desired_width(220.0)
                             .hint_text("e.g. toggled relay 1 / set speed 50"),
                     );
-                    if ui.button("📝 Add Note to Log").clicked()
-                        || (note_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                    {
+                    let note_enter =
+                        note_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("📝 Add Note to Log").clicked() || note_enter {
+                        if note_enter {
+                            text_edit_submitted = true;
+                        }
                         let note = self.log_note_input.trim().to_string();
                         if !note.is_empty() {
                             self.ctrl.state.lock().unwrap().annotate_log(&note);
@@ -749,30 +763,30 @@ impl eframe::App for SmtGuiApp {
                         );
                         if ui
                             .selectable_label(
-                                self.view_mode == CenterViewMode::PuttyTerminal,
+                                self.view_mode == CentreViewMode::PuttyTerminal,
                                 "🖥 PuTTY Live Terminal",
                             )
                             .clicked()
                         {
-                            self.view_mode = CenterViewMode::PuttyTerminal;
+                            self.view_mode = CentreViewMode::PuttyTerminal;
                         }
                         if ui
                             .selectable_label(
-                                self.view_mode == CenterViewMode::SplitTerminalAndPackets,
+                                self.view_mode == CentreViewMode::SplitTerminalAndPackets,
                                 "🗔 Split (PuTTY + Packets)",
                             )
                             .clicked()
                         {
-                            self.view_mode = CenterViewMode::SplitTerminalAndPackets;
+                            self.view_mode = CentreViewMode::SplitTerminalAndPackets;
                         }
                         if ui
                             .selectable_label(
-                                self.view_mode == CenterViewMode::PacketInspector,
+                                self.view_mode == CentreViewMode::PacketInspector,
                                 "📡 Packet Inspector",
                             )
                             .clicked()
                         {
-                            self.view_mode = CenterViewMode::PacketInspector;
+                            self.view_mode = CentreViewMode::PacketInspector;
                         }
 
                         ui.separator();
@@ -886,16 +900,17 @@ impl eframe::App for SmtGuiApp {
             ui.add_space(4.0);
 
             match self.view_mode {
-                CenterViewMode::PuttyTerminal => {
+                CentreViewMode::PuttyTerminal => {
                     self.render_putty_terminal_pane(
                         ui,
                         ctx,
                         &ports,
                         terminal_local_echo,
                         terminal_crlf,
+                        &mut text_edit_submitted,
                     );
                 }
-                CenterViewMode::PacketInspector => {
+                CentreViewMode::PacketInspector => {
                     self.render_packet_inspector_pane(
                         ui,
                         stream_paused,
@@ -905,7 +920,7 @@ impl eframe::App for SmtGuiApp {
                         &filtered_frames,
                     );
                 }
-                CenterViewMode::SplitTerminalAndPackets => {
+                CentreViewMode::SplitTerminalAndPackets => {
                     ui.columns(2, |cols| {
                         self.render_putty_terminal_pane(
                             &mut cols[0],
@@ -913,6 +928,7 @@ impl eframe::App for SmtGuiApp {
                             &ports,
                             terminal_local_echo,
                             terminal_crlf,
+                            &mut text_edit_submitted,
                         );
                         self.render_packet_inspector_pane(
                             &mut cols[1],
@@ -927,10 +943,12 @@ impl eframe::App for SmtGuiApp {
             }
 
             // Capture live character-by-character keystrokes (PuTTY style) when terminal mode is active
-            // and no TextEdit widget currently owns keyboard focus.
-            if self.view_mode != CenterViewMode::PacketInspector
+            // and no TextEdit widget owned or surrendered keyboard focus during this frame.
+            if self.view_mode != CentreViewMode::PacketInspector
                 && self.terminal_live_keystrokes
+                && !kb_claimed_before
                 && !ctx.wants_keyboard_input()
+                && !text_edit_submitted
             {
                 let mut outgoing = Vec::new();
                 let events = ctx.input(|i| i.events.clone());
@@ -941,6 +959,32 @@ impl eframe::App for SmtGuiApp {
                                 outgoing.extend_from_slice(text.as_bytes());
                             }
                         }
+                        egui::Event::Paste(text) => {
+                            if !text.is_empty() {
+                                outgoing.extend_from_slice(&format_paste_bytes(&text, terminal_crlf));
+                            }
+                        }
+                        egui::Event::Copy => {
+                            // In PuTTY live terminal focus, Ctrl+C transmits ETX (0x03) to the remote device
+                            outgoing.push(0x03);
+                        }
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if modifiers.ctrl || modifiers.command => match key {
+                            egui::Key::A => outgoing.push(0x01),
+                            egui::Key::C => outgoing.push(0x03),
+                            egui::Key::D => outgoing.push(0x04),
+                            egui::Key::E => outgoing.push(0x05),
+                            egui::Key::K => outgoing.push(0x0B),
+                            egui::Key::L => outgoing.push(0x0C),
+                            egui::Key::U => outgoing.push(0x15),
+                            egui::Key::W => outgoing.push(0x17),
+                            egui::Key::Z => outgoing.push(0x1A),
+                            _ => {}
+                        },
                         egui::Event::Key {
                             key: egui::Key::Enter,
                             pressed: true,
@@ -960,11 +1004,67 @@ impl eframe::App for SmtGuiApp {
                             outgoing.push(0x08);
                         }
                         egui::Event::Key {
+                            key: egui::Key::Delete,
+                            pressed: true,
+                            ..
+                        } => {
+                            outgoing.extend_from_slice(b"\x1b[3~");
+                        }
+                        egui::Event::Key {
                             key: egui::Key::Tab,
                             pressed: true,
                             ..
                         } => {
                             outgoing.push(b'\t');
+                        }
+                        egui::Event::Key {
+                            key: egui::Key::Escape,
+                            pressed: true,
+                            ..
+                        } => {
+                            outgoing.push(0x1B);
+                        }
+                        egui::Event::Key {
+                            key: egui::Key::ArrowUp,
+                            pressed: true,
+                            ..
+                        } => {
+                            outgoing.extend_from_slice(b"\x1b[A");
+                        }
+                        egui::Event::Key {
+                            key: egui::Key::ArrowDown,
+                            pressed: true,
+                            ..
+                        } => {
+                            outgoing.extend_from_slice(b"\x1b[B");
+                        }
+                        egui::Event::Key {
+                            key: egui::Key::ArrowRight,
+                            pressed: true,
+                            ..
+                        } => {
+                            outgoing.extend_from_slice(b"\x1b[C");
+                        }
+                        egui::Event::Key {
+                            key: egui::Key::ArrowLeft,
+                            pressed: true,
+                            ..
+                        } => {
+                            outgoing.extend_from_slice(b"\x1b[D");
+                        }
+                        egui::Event::Key {
+                            key: egui::Key::Home,
+                            pressed: true,
+                            ..
+                        } => {
+                            outgoing.extend_from_slice(b"\x1b[H");
+                        }
+                        egui::Event::Key {
+                            key: egui::Key::End,
+                            pressed: true,
+                            ..
+                        } => {
+                            outgoing.extend_from_slice(b"\x1b[F");
                         }
                         _ => {}
                     }
@@ -989,6 +1089,7 @@ impl SmtGuiApp {
         ports: &[nport5610_core::PortState],
         terminal_local_echo: bool,
         terminal_crlf: bool,
+        text_edit_submitted: &mut bool,
     ) {
         let sel_ps = ports.get((self.selected_port - 1) as usize);
         let is_conn = sel_ps.map(|p| p.connected).unwrap_or(false);
@@ -1056,9 +1157,14 @@ impl SmtGuiApp {
                     .font(FontId::monospace(12.5))
                     .hint_text("Type command line & press Enter (or click screen below for live keystrokes)"),
             );
-            let send_clicked = ui.button("⏎ Send Line").clicked()
-                || (line_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            let enter_on_line =
+                line_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let send_clicked = ui.button("⏎ Send Line").clicked() || enter_on_line;
             if send_clicked {
+                if enter_on_line {
+                    *text_edit_submitted = true;
+                    line_resp.request_focus();
+                }
                 let mut bytes = self.terminal_line_input.as_bytes().to_vec();
                 if terminal_crlf {
                     bytes.extend_from_slice(b"\r\n");

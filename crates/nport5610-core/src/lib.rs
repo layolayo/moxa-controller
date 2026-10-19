@@ -1030,6 +1030,46 @@ pub struct PortState {
     pub tx_frames: u64,
     pub terminal_text: String,
     pub last_was_cr: bool,
+    #[serde(default)]
+    pub ansi_state: u8,
+    #[serde(default)]
+    pub csi_params: String,
+}
+
+/// Normalise pasted text line endings (`\r\n` or `\n` or `\r`) for serial transmission.
+pub fn format_paste_bytes(text: &str, crlf: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 8);
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                if crlf {
+                    out.extend_from_slice(b"\r\n");
+                } else {
+                    out.push(b'\r');
+                }
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            b'\n' => {
+                if crlf {
+                    out.extend_from_slice(b"\r\n");
+                } else {
+                    out.push(b'\r');
+                }
+                i += 1;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 impl PortState {
@@ -1056,6 +1096,8 @@ impl PortState {
             tx_frames: 0,
             terminal_text: String::new(),
             last_was_cr: false,
+            ansi_state: 0,
+            csi_params: String::new(),
         }
     }
 
@@ -1068,9 +1110,68 @@ impl PortState {
     }
 
     /// Append raw serial RX or local-echoed TX bytes into the PuTTY-style live terminal buffer.
+    /// Handles CR/LF normalisation across chunks, backspace (`0x08`/`0x7F`), and ANSI/VT100
+    /// escape sequences (`\x1b[...` CSI and `\x1b]...` OSC).
     pub fn append_terminal_bytes(&mut self, bytes: &[u8]) {
         for &b in bytes {
+            match self.ansi_state {
+                1 => {
+                    // Immediately after ESC (0x1B)
+                    self.last_was_cr = false;
+                    match b {
+                        b'[' => {
+                            self.ansi_state = 2;
+                            self.csi_params.clear();
+                        }
+                        b']' => {
+                            self.ansi_state = 3;
+                        }
+                        b'c' => {
+                            // ESC c (RIS — Reset to Initial State)
+                            self.clear_terminal();
+                        }
+                        _ => {
+                            self.ansi_state = 0;
+                        }
+                    }
+                    continue;
+                }
+                2 => {
+                    // Inside CSI sequence (\x1b[...)
+                    if (0x20..=0x3F).contains(&b) {
+                        if self.csi_params.len() < 32 {
+                            self.csi_params.push(b as char);
+                        }
+                    } else if (0x40..=0x7E).contains(&b) {
+                        if b == b'J' && (self.csi_params == "2" || self.csi_params == "3") {
+                            self.clear_terminal();
+                        } else {
+                            self.ansi_state = 0;
+                            self.csi_params.clear();
+                        }
+                    } else {
+                        self.ansi_state = 0;
+                        self.csi_params.clear();
+                    }
+                    continue;
+                }
+                3 => {
+                    // Inside OSC sequence (\x1b]...) until BEL (0x07) or newline
+                    if b == 0x07 || b == b'\r' || b == b'\n' {
+                        self.ansi_state = 0;
+                    } else if b == 0x1B {
+                        self.ansi_state = 1;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
             match b {
+                0x1B => {
+                    self.ansi_state = 1;
+                    self.last_was_cr = false;
+                }
                 b'\r' => {
                     self.terminal_text.push('\n');
                     self.last_was_cr = true;
@@ -1092,6 +1193,10 @@ impl PortState {
                     self.terminal_text.push_str("    ");
                     self.last_was_cr = false;
                 }
+                0x07 => {
+                    // BEL — ignore silently in text buffer
+                    self.last_was_cr = false;
+                }
                 0x20..=0x7E => {
                     self.terminal_text.push(b as char);
                     self.last_was_cr = false;
@@ -1102,9 +1207,14 @@ impl PortState {
                 }
             }
         }
-        // Keep a rolling 16 KB terminal history
+        // Keep a rolling 16 KB terminal history aligned to UTF-8 character boundaries
         if self.terminal_text.len() > 16384 {
-            let drain_to = self.terminal_text.len() - 12288;
+            let mut drain_to = self.terminal_text.len() - 12288;
+            while drain_to < self.terminal_text.len()
+                && !self.terminal_text.is_char_boundary(drain_to)
+            {
+                drain_to += 1;
+            }
             if let Some(pos) = self.terminal_text[drain_to..].find('\n') {
                 self.terminal_text.drain(..drain_to + pos + 1);
             } else {
@@ -1116,6 +1226,8 @@ impl PortState {
     pub fn clear_terminal(&mut self) {
         self.terminal_text.clear();
         self.last_was_cr = false;
+        self.ansi_state = 0;
+        self.csi_params.clear();
     }
 }
 
@@ -2831,4 +2943,22 @@ mod tests {
         assert!(ps.terminal_text.is_empty());
         assert!(!ps.last_was_cr);
     }
+
+    #[test]
+    fn test_putty_terminal_ansi_escape_and_paste_handling() {
+        let mut ps = PortState::new(1);
+        // Remote shell prompt with SGR colour codes and readline backspace-erase (\x08\x1b[K) split across chunks
+        ps.append_terminal_bytes(b"\x1b[1;32mroot@moxa\x1b[0m# helx\x08\x1b");
+        ps.append_terminal_bytes(b"[Klo\r\n");
+        assert_eq!(ps.terminal_text, "root@moxa# hello\n");
+
+        // Remote clear screen (\x1b[2J\x1b[H) clears prior history and positions new prompt
+        ps.append_terminal_bytes(b"\x1b[2J\x1b[HREADY> ");
+        assert_eq!(ps.terminal_text, "READY> ");
+
+        // Paste line ending normalisation for CR+LF and CR modes
+        assert_eq!(format_paste_bytes("AT\nAT+CSQ\r\n", true), b"AT\r\nAT+CSQ\r\n");
+        assert_eq!(format_paste_bytes("AT\nAT+CSQ\r\n", false), b"AT\rAT+CSQ\r");
+    }
 }
+
